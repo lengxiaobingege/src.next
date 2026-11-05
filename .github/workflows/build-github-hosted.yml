@@ -25,7 +25,7 @@ on:
         required: true
         default: 'KiwiX'
       chromiumTag:
-        description: 'Chromium tag（默认 132.0.6834.83 = Kiwi 停更时的内核）'
+        description: 'Chromium tag（必须与 chromium 分支 rebase 的版本一致：132.0.6834.83）'
         required: true
         default: '132.0.6834.83'
 
@@ -147,10 +147,10 @@ jobs:
           df -h /
 
       # ================= 4. Kiwi 补丁 =================
-      - name: 检出 Kiwi 源码
+      - name: 检出 Kiwi 改动（chromium 分支 = 已 rebase 到 132 的增量）
         uses: actions/checkout@v4
         with:
-          ref: kiwi
+          ref: chromium
           path: kiwi-patch
 
       - name: 应用 Kiwi 定制
@@ -160,7 +160,7 @@ jobs:
           find . -type f -not -path "./.git/*" -not -path "./.github/*" | wc -l
           rsync -a \
             --exclude='.git' --exclude='.github' --exclude='.build' \
-            --exclude='CHROMIUM_VERSION' --exclude='KIWI_VERSION' \
+            --exclude='CHROMIUM_VERSION' --exclude='KIWI_VERSION' --exclude='VERSION' \
             --exclude='README.md' --exclude='LICENSE' --exclude='*.svg' \
             ./ "$WORKSPACE/src/"
           cd "$WORKSPACE/src"
