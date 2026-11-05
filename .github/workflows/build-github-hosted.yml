@@ -210,6 +210,7 @@ jobs:
             echo 'android_keystore_path = "../../keystore.jks"'
             echo ''
             echo 'enable_extensions = true'
+            echo 'enable_guest_view = true'
             echo 'enable_pdf = false'
             echo 'enable_plugins = false'
             echo 'enable_nacl = false'
