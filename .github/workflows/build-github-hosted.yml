@@ -244,6 +244,11 @@ jobs:
           apply('BUILD.gn', [
             ('    if (enable_extensions) {\n      deps += [\n        "//extensions:extensions_browsertests",',
              '    if (enable_extensions && !is_android) {\n      deps += [\n        "//extensions:extensions_browsertests",'),
+            # 修补 5: gn_all 的 is_android 分支里还有一处（第 579 行）：
+            #   if (is_android) { ... if (enable_extensions) { deps += //extensions/shell:app_shell } }
+            #   → app_shell → app_shell_lib → //apps → assert(!is_android)
+            ('      if (enable_extensions) {\n        deps += [ "//extensions/shell:app_shell" ]\n      }',
+             '      if (enable_extensions && !is_android) {\n        deps += [ "//extensions/shell:app_shell" ]\n      }'),
           ], 'BUILD.gn (gn_all)')
           PY
           echo "=== 校验 ==="
