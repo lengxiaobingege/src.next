@@ -230,9 +230,24 @@ jobs:
             ('  if (enable_extensions) {\n    sources += [\n      "../browser/apps/platform_apps/app_browsertest_util.cc",',
              '  if (enable_extensions && !is_android) {\n    sources += [\n      "../browser/apps/platform_apps/app_browsertest_util.cc",'),
           ], 'chrome/test/BUILD.gn')
+
+          # --- 根 BUILD.gn: 一处（gn_all 里的 enable_extensions 块）---
+          # 这是整条桌面测试依赖链的源头：
+          # gn gen 默认解析全图（含 gn_all），该块无条件把
+          #   //extensions:extensions_browsertests
+          #   //extensions:extensions_unittests
+          #   //extensions/shell:app_shell_unittests
+          # 拉进依赖树；而 extensions/shell 子系统通篇没有 is_android 判断，
+          # 其 app_shell_lib 依赖 40+ 个 assert(!is_android) 的桌面组件。
+          # gn_all 只是「全部目标清单」，不影响 chrome_public_apk 的编译内容，
+          # 在安卓下跳过其中桌面专用测试目标即可。
+          apply('BUILD.gn', [
+            ('    if (enable_extensions) {\n      deps += [\n        "//extensions:extensions_browsertests",',
+             '    if (enable_extensions && !is_android) {\n      deps += [\n        "//extensions:extensions_browsertests",'),
+          ], 'BUILD.gn (gn_all)')
           PY
           echo "=== 校验 ==="
-          grep -c 'enable_extensions && !is_android' extensions/BUILD.gn chrome/test/BUILD.gn
+          grep -c 'enable_extensions && !is_android' extensions/BUILD.gn chrome/test/BUILD.gn BUILD.gn
           df -h /
 
       # ================= 5. 签名 =================
