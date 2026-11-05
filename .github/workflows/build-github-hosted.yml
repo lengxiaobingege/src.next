@@ -139,8 +139,7 @@ jobs:
           df -h /
           # --shallow: 只拉所需深度
           # --no-history: 不要完整历史
-          # --revision: 确保版本一致
-          gclient sync --nohooks --no-history --shallow --prune -j 8
+          gclient sync --nohooks --no-history --shallow -j 8
           echo "结束: $(date)"
           echo "=== 磁盘 ==="
           df -h /
