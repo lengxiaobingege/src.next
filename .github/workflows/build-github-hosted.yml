@@ -257,9 +257,24 @@ jobs:
             ('      if (enable_extensions) {\n        deps += [ "//extensions/shell:app_shell" ]\n      }',
              '      if (enable_extensions && !is_android) {\n        deps += [ "//extensions/shell:app_shell" ]\n      }'),
           ], 'BUILD.gn (gn_all)')
+
+          # --- apps/BUILD.gn: 放宽 assert（修补 7）---
+          # 根因：chrome/browser:browser 的 enable_extensions 块无条件依赖 //apps
+          #   （第 7747 行），而 browser 是 chrome_public_apk 的必经依赖，
+          #   这条 //apps 引用无法绕开（Kiwi 扩展功能需要它所在的块）。
+          # //apps 实际是「Chrome Apps 平台应用」基础设施库，源码 include
+          #   全部为跨平台模块（apps/ extensions/ content/ base/），
+          #   deps 也全部跨平台（base/content/extensions/components）。
+          # 官方的 assert(!is_android && !is_ios) 只是"安卓没有 Chrome Apps"的
+          #   产品性限制，并非技术上不可编译。放宽为仅排除 iOS。
+          apply('apps/BUILD.gn', [
+            ('assert(!is_android && !is_ios)',
+             'assert(!is_ios)'),
+          ], 'apps/BUILD.gn')
           PY
           echo "=== 校验 ==="
           grep -c 'enable_extensions && !is_android' extensions/BUILD.gn chrome/test/BUILD.gn BUILD.gn
+          grep -n 'assert(!is_ios)' apps/BUILD.gn
           df -h /
 
       # ================= 5. 签名 =================
