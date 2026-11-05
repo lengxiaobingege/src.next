@@ -60,6 +60,14 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/* || true
           sudo rm -rf /var/cache/apt/archives/* || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /imagegeneration || true
+          sudo rm -rf /usr/lib/jvm/*/jmods || true
+          sudo rm -rf /usr/share/ri || true
+          sudo rm -rf /usr/local/go || true
+          sudo rm -rf /opt/google || true
+          docker image prune -af || true
 
           echo "=== 清理后 ==="
           df -h /
@@ -68,9 +76,13 @@ jobs:
         run: |
           AVAIL=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
           echo "可用空间: ${AVAIL}GB"
-          if (( AVAIL < 110 )); then
-            echo "::error::磁盘不足 110GB，编译必然失败"
+          if (( AVAIL < 40 )); then
+            echo "::error::磁盘不足 40GB，无法继续"
             exit 1
+          fi
+          if (( AVAIL < 60 )); then
+            echo "::warning::磁盘仅 ${AVAIL}GB，将启用精简构建"
+            echo "LEAN_BUILD=1" >> $GITHUB_ENV
           fi
 
       # ================= 2. 依赖 =================
@@ -128,7 +140,7 @@ jobs:
           # --shallow: 只拉所需深度
           # --no-history: 不要完整历史
           # --revision: 确保版本一致
-          gclient sync --nohooks --no-history --shallow -j 8
+          gclient sync --nohooks --no-history --shallow --prune -j 8
           echo "结束: $(date)"
           echo "=== 磁盘 ==="
           df -h /
