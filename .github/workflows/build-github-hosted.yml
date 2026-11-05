@@ -171,7 +171,7 @@ jobs:
       # ================= 5. 签名 =================
       - name: 生成 keystore
         run: |
-          cd "$WORKSPACE"
+          cd "$WORKSPACE/src"
           keytool -genkeypair -v \
             -keystore keystore.jks -alias kiwi \
             -keyalg RSA -keysize 2048 -validity 10000 \
@@ -182,7 +182,7 @@ jobs:
       # ================= 6. GN =================
       - name: 生成 args.gn
         run: |
-          cd "$WORKSPACE"
+          cd "$WORKSPACE/src"
           mkdir -p out/android_arm64
           {
             echo 'target_os = "android"'
@@ -240,7 +240,7 @@ jobs:
       - name: gn gen
         run: |
           export PATH="$HOME/depot_tools:$PATH"
-          cd "$WORKSPACE"
+          cd "$WORKSPACE/src"
           gn gen out/android_arm64
           echo "=== gn gen 成功 ==="
           df -h /
@@ -249,7 +249,7 @@ jobs:
       - name: 编译
         run: |
           export PATH="$HOME/depot_tools:$PATH"
-          cd "$WORKSPACE"
+          cd "$WORKSPACE/src"
           echo "编译开始: $(date)"
           df -h /
           autoninja -C out/android_arm64 -j 4 chrome_public_apk
@@ -261,7 +261,7 @@ jobs:
       - name: 收集 APK
         if: always()
         run: |
-          cd "$WORKSPACE" 2>/dev/null || exit 0
+          cd "$WORKSPACE/src" 2>/dev/null || exit 0
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           find out/android_arm64/apks -name "*.apk" -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \; 2>/dev/null || echo "未找到 APK"
           ls -lh "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
