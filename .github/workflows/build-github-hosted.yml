@@ -51,7 +51,7 @@ jobs:
           sudo rm -rf /opt/ghc || true
           sudo rm -rf /usr/local/.ghcup || true
           sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
           sudo rm -rf /usr/share/swift || true
           sudo rm -rf /usr/local/lib/node_modules || true
           sudo rm -rf /opt/hostedtoolcache || true
@@ -95,22 +95,22 @@ jobs:
             ccache ninja-build pkg-config file
           java -version 2>&1 | head -2
           ccache --max-size=2G
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          echo "CCACHE_DIR=${HOME}/.ccache" >> "${GITHUB_ENV}"
 
       - name: 安装 depot_tools
         run: |
           git clone --depth 1 \
             https://chromium.googlesource.com/chromium/tools/depot_tools.git \
             "$HOME/depot_tools"
-          echo "$HOME/depot_tools" >> $GITHUB_PATH
+          echo "${HOME}/depot_tools" >> "${GITHUB_PATH}"
 
       # ================= 3. 单次 gclient sync =================
       - name: 配置 .gclient（版本直接写入 URL，避免二次 sync）
         run: |
-          WS="$RUNNER_WORKSPACE/chromium"
+          WS="${RUNNER_WORKSPACE}/chromium"
           mkdir -p "$WS"
           cd "$WS"
-          echo "WORKSPACE=$WS" >> $GITHUB_ENV
+          echo "WORKSPACE=${WS}" >> "${GITHUB_ENV}"
 
           TAG="${{ github.event.inputs.chromiumTag }}"
 
