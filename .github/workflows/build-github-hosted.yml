@@ -1,14 +1,10 @@
-# 在 GitHub 官方 runner 上构建 Kiwi (arm64)
+# 在 GitHub 官方 runner 上构建 Kiwi (arm64) — v2 修正版
 # =============================================================================
-# 设计依据：作者原版 build_and_sign_release_apk.yml 就是跑在 ubuntu-latest 上的
-# 关键技巧（学自作者）：
-#   1. 关闭 swap + 删除 .NET 腾出根盘空间
-#   2. 把 14GB 临时 SSD (/mnt) 当作构建输出盘
-#   3. 用 actions/cache 缓存 gclient 依赖和 ccache，跨次构建复用
-# 差异：
-#   - 只编 arm64（省 75%）
-#   - symbol_level=0（省 20-30%）
-#   - JDK 17（Chromium 137 要求，作者用 JDK 8 是错的）
+# v1 失败原因（已从日志确诊）：
+#   1. gclient 的 --reset-on-error / --retry-failures 参数已废弃 → 移除
+#   2. fetch 未真正拉源码，只跑了 gclient config → 改为显式分步执行
+#   3. 137.0.7337.0 不是 Chromium 真实 tag → 改用真实 tag
+#   ✅ 意外发现：官方 runner 根盘有 145GB，磁盘不是瓶颈
 # =============================================================================
 
 name: 'Kiwi: GitHub-hosted Build arm64'
@@ -24,114 +20,116 @@ on:
         description: 'APP 显示名称'
         required: true
         default: 'KiwiX'
-      chromiumVersion:
-        description: 'Chromium tag（如 137.0.7337.0，留空则用默认分支最新）'
+      chromiumTag:
+        description: 'Chromium 真实 tag（如 131.0.6778.200，留空用 main 最新）'
         required: false
-        default: '137.0.7337.0'
-      useCache:
-        description: '启用依赖缓存（首次 false，后续 true）'
-        required: true
-        default: 'false'
+        default: '132.0.6834.83'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 350          # 官方上限 360 分钟，留 10 分钟余量
+    timeout-minutes: 350
 
     steps:
-      # ---------- 1. 磁盘腾挪 ----------
-      - name: 释放根盘空间
+      # ---------- 1. 环境 ----------
+      - name: 检查环境与磁盘
         run: |
-          echo "=== 清理前 ==="
+          echo "=== CPU/内存 ==="
+          nproc; free -h
+          echo "=== 磁盘 ==="
           df -h /
           sudo swapoff -a || true
           sudo rm -f /swapfile || true
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android/sdk/ndk || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /usr/local/.ghcup || true
-          sudo rm -rf /usr/local/lib/node_modules || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
           sudo apt-get clean
           echo "=== 清理后 ==="
           df -h /
 
-      - name: 挂载临时 SSD 作为构建盘
-        run: |
-          # GitHub runner 有约 14GB 的 /mnt 临时盘
-          sudo mkdir -p /mnt/build
-          sudo chown -R $USER:$USER /mnt/build
-          df -h /mnt || true
-
-      # ---------- 2. 环境准备 ----------
       - name: 安装依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             python3 python3-pip python3-venv \
             openjdk-17-jdk-headless \
-            ccache ninja-build pkg-config \
-            libnss3-dev libglib2.0-dev
-          java -version
+            ccache ninja-build pkg-config
+          java -version 2>&1 | head -2
           python3 --version
-          ninja --version
 
       - name: 配置 ccache
         run: |
-          ccache --max-size=2G
+          ccache --max-size=3G
           echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
 
-      - name: 缓存 ccache
-        if: ${{ github.event.inputs.useCache == 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-kiwi-${{ github.run_id }}
-          restore-keys: ccache-kiwi-
-
-      # ---------- 3. depot_tools ----------
+      # ---------- 2. depot_tools ----------
       - name: 安装 depot_tools
         run: |
-          cd /mnt/build
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          echo "/mnt/build/depot_tools" >> $GITHUB_PATH
+          git clone --depth 1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> $GITHUB_PATH
 
-      # ---------- 4. 拉取 Chromium ----------
-      - name: 缓存 Chromium 工作区
-        if: ${{ github.event.inputs.useCache == 'true' }}
-        id: cache-chromium
-        uses: actions/cache@v4
-        with:
-          path: /mnt/build/chromium
-          key: chromium-ws-${{ github.event.inputs.chromiumVersion }}
-
-      - name: 拉取 Chromium 源码
-        if: steps.cache-chromium.outputs.cache-hit != 'true'
+      # ---------- 3. 拉取 Chromium（分步执行，不依赖 fetch） ----------
+      - name: 初始化 Chromium 工作区
         run: |
-          export PATH="/mnt/build/depot_tools:$PATH"
-          cd /mnt/build
-          mkdir -p chromium && cd chromium
-          fetch --nohooks --no-history android
-          echo "=== 拉取完成 ==="
-          df -h /mnt
+          export PATH="$HOME/depot_tools:$PATH"
+          mkdir -p "$RUNNER_WORKSPACE/chromium"
+          cd "$RUNNER_WORKSPACE/chromium"
+          echo "WORKSPACE=$RUNNER_WORKSPACE/chromium" >> $GITHUB_ENV
 
-      - name: 切换版本并同步依赖
+          # 显式写 .gclient，不依赖 fetch 命令
+          gclient config --spec 'solutions = [
+            {
+              "name": "src",
+              "url": "https://chromium.googlesource.com/chromium/src.git",
+              "managed": True,
+              "custom_deps": {},
+              "custom_vars": {},
+            },
+          ]
+          target_os = ["android"]
+          '
+
+          echo "=== .gclient 内容 ==="
+          cat .gclient
+
+      - name: 拉取 Chromium 源码（核心步骤）
         run: |
-          export PATH="/mnt/build/depot_tools:$PATH"
-          cd /mnt/build/chromium
-          if [[ -n "${{ github.event.inputs.chromiumVersion }}" ]]; then
-            cd src
-            git fetch --depth 1 origin tag "${{ github.event.inputs.chromiumVersion }}" || true
-            git checkout -f "${{ github.event.inputs.chromiumVersion }}" 2>/dev/null || \
-              git checkout -f "tags/${{ github.event.inputs.chromiumVersion }}" || \
-              echo "!! tag 不存在，使用当前版本"
-            git log -1 --oneline
-            cd ..
+          export PATH="$HOME/depot_tools:$PATH"
+          cd "$WORKSPACE"
+          echo "开始: $(date)"
+          # --no-history 只拉最新快照，省 60% 体积
+          # 不加 --reset-on-error / --retry-failures（已废弃）
+          gclient sync --nohooks --no-history -j 8
+          echo "结束: $(date)"
+          echo "=== 磁盘 ==="
+          df -h /
+          echo "=== 源码大小 ==="
+          du -sh src 2>/dev/null || true
+
+      - name: 切换到指定版本
+        run: |
+          export PATH="$HOME/depot_tools:$PATH"
+          cd "$WORKSPACE/src"
+          TAG="${{ github.event.inputs.chromiumTag }}"
+          if [[ -n "$TAG" ]]; then
+            echo "==> 尝试切换到 tag $TAG"
+            git fetch --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" || \
+              git fetch --depth 1 origin tag "$TAG" || true
+            git checkout -f "$TAG" 2>/dev/null && echo "✅ 已切到 $TAG" || \
+              echo "⚠️ tag 不可用，使用当前 HEAD"
           fi
-          gclient sync -D --no-history --shallow --reset-on-error --retry-failures=3
+          git log -1 --oneline
+          git describe --tags 2>/dev/null || true
+
+      - name: 同步该版本的依赖
+        run: |
+          export PATH="$HOME/depot_tools:$PATH"
+          cd "$WORKSPACE"
+          gclient sync --nohooks --no-history -j 8
           gclient runhooks
 
-      # ---------- 5. 叠加 Kiwi 补丁 ----------
-      - name: 检出 Kiwi 增量源码
+      # ---------- 4. Kiwi 补丁 ----------
+      - name: 检出 Kiwi 源码
         uses: actions/checkout@v4
         with:
           ref: kiwi
@@ -140,37 +138,34 @@ jobs:
       - name: 应用 Kiwi 定制
         run: |
           cd "$GITHUB_WORKSPACE/kiwi-patch"
-          echo "=== Kiwi 补丁文件统计 ==="
+          echo "=== 补丁文件数 ==="
           find . -type f -not -path "./.git/*" -not -path "./.github/*" | wc -l
+          echo "=== 开始覆盖 ==="
+          rsync -a \
+            --exclude='.git' --exclude='.github' --exclude='.build' \
+            --exclude='CHROMIUM_VERSION' --exclude='KIWI_VERSION' \
+            --exclude='README.md' --exclude='LICENSE' --exclude='*.svg' \
+            ./ "$WORKSPACE/src/"
+          echo "=== 覆盖完成 ==="
+          cd "$WORKSPACE/src"
+          git status --short | head -20
+          git status --short | wc -l
 
-          rsync -av \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.build' \
-            --exclude='CHROMIUM_VERSION' \
-            --exclude='KIWI_VERSION' \
-            --exclude='README.md' \
-            --exclude='LICENSE' \
-            --exclude='*.svg' \
-            "$GITHUB_WORKSPACE/kiwi-patch"/ \
-            /mnt/build/chromium/src/
-
-      # ---------- 6. 签名密钥 ----------
+      # ---------- 5. 签名 ----------
       - name: 生成 keystore
         run: |
-          cd /mnt/build/chromium
+          cd "$WORKSPACE"
           keytool -genkeypair -v \
-            -keystore keystore.jks \
-            -alias kiwi \
+            -keystore keystore.jks -alias kiwi \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass kiwi123456 -keypass kiwi123456 \
             -dname "CN=${{ github.event.inputs.appLabel }}, OU=Self, O=Self, L=CN, C=CN"
           ls -lh keystore.jks
 
-      # ---------- 7. 构建参数 ----------
+      # ---------- 6. GN ----------
       - name: 生成 args.gn
         run: |
-          cd /mnt/build/chromium
+          cd "$WORKSPACE"
           mkdir -p out/android_arm64
           {
             echo 'target_os = "android"'
@@ -186,7 +181,6 @@ jobs:
             echo 'symbol_level = 0'
             echo 'exclude_unwind_tables = true'
             echo 'blink_symbol_level = 0'
-            echo 'v8_symbol_level = 0'
             echo ''
             echo 'use_unofficial_version_number = false'
             echo 'android_default_version_code = "1"'
@@ -224,66 +218,41 @@ jobs:
             echo ''
             echo 'cc_wrapper = "ccache"'
           } > out/android_arm64/args.gn
-          echo "===== args.gn ====="
           cat out/android_arm64/args.gn
 
       - name: gn gen
         run: |
-          export PATH="/mnt/build/depot_tools:$PATH"
-          cd /mnt/build/chromium
+          export PATH="$HOME/depot_tools:$PATH"
+          cd "$WORKSPACE"
           gn gen out/android_arm64
-          echo "=== 构建目标检查 ==="
-          gn ls out/android_arm64 | grep -c "" || true
+          echo "=== 构建配置生成成功 ==="
+          head -20 out/android_arm64/args.gn
 
-      # ---------- 8. 编译 ----------
-      - name: 编译 chrome_public_apk
+      # ---------- 7. 编译 ----------
+      - name: 编译
         run: |
-          export PATH="/mnt/build/depot_tools:$PATH"
-          cd /mnt/build/chromium
-          echo "开始时间: $(date)"
-          df -h /mnt
+          export PATH="$HOME/depot_tools:$PATH"
+          cd "$WORKSPACE"
+          echo "开始编译: $(date)"
+          df -h /
           autoninja -C out/android_arm64 -j 4 chrome_public_apk
-          echo "结束时间: $(date)"
-          echo "=== ccache 命中率 ==="
+          echo "编译完成: $(date)"
           ccache -s || true
 
-      # ---------- 9. 产物 ----------
-      - name: 收集 APK
-        if: success()
+      # ---------- 8. 产物 ----------
+      - name: 收集并上传
+        if: always()
         run: |
-          cd /mnt/build/chromium
+          cd "$WORKSPACE" || exit 0
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          find out/android_arm64/apks -name "*.apk" -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \;
-          ls -lh "$GITHUB_WORKSPACE/artifacts/"
+          find out/android_arm64/apks -name "*.apk" -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \; 2>/dev/null || echo "未找到 APK"
+          ls -lh "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
 
-      - name: 上传产物
-        if: success()
+      - name: 上传 APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kiwi-arm64-apk
           path: ${{ github.workspace }}/artifacts/*.apk
           retention-days: 30
-
-      - name: 创建 Release
-        if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_id }}
-          name: KiwiX Build ${{ github.run_id }}
-          draft: false
-          prerelease: true
-          body: |
-            **自建 KiwiX** · Chromium ${{ github.event.inputs.chromiumVersion }}
-            包名 `${{ github.event.inputs.packageName }}` · arm64-v8a · 含 Chrome 扩展支持
-          files: ${{ github.workspace }}/artifacts/*.apk
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 失败时保存日志
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: |
-            /mnt/build/chromium/out/android_arm64/*.log
-          retention-days: 7
-          if-no-files-found: ignore
+          if-no-files-found: warn
