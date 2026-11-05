@@ -1,0 +1,269 @@
+# Build Kiwi Browser APK (arm64) — 自托管 Runner 版本
+# =============================================================================
+# 相比原版 workflow 的改动：
+#   1. runs-on 改为 self-hosted
+#   2. 移除 longbuild.find.kiwi 私有构建服务调用
+#   3. 移除 rclone 私有 SFTP 缓存
+#   4. 改为标准 Chromium 构建：fetch → gclient sync → gn gen → autoninja
+#   5. 改用自建 keystore 签名
+#   6. 只编译 arm64（Redmi K80 Pro）
+#   7. JDK 8 → JDK 17
+# =============================================================================
+
+name: 'Kiwi: Build arm64 APK'
+
+on:
+  workflow_dispatch:
+    inputs:
+      packageName:
+        description: 'APK 包名 (applicationId)'
+        required: true
+        default: 'com.lengxiaobing.kiwi'
+      appLabel:
+        description: 'APP 显示名称'
+        required: true
+        default: 'KiwiX'
+      chromiumVersion:
+        description: 'Chromium 版本（对应 tag，如 137.0.7337.0）'
+        required: true
+        default: '137.0.7337.0'
+      cleanBuild:
+        description: '是否清理后全量重编（true/false）'
+        required: true
+        default: 'false'
+
+env:
+  CHROMIUM_VERSION: ${{ github.event.inputs.chromiumVersion }}
+  CCACHE_DIR: $HOME/.ccache
+  DEPOT_TOOLS_UPDATE: 1
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64, kiwi-builder]
+    timeout-minutes: 720   # 12 小时，自托管不受 6 小时限制
+
+    steps:
+      # --- 0. 环境信息 ---
+      - name: 环境检查
+        run: |
+          echo "主机: $(hostname)"
+          echo "CPU: $(nproc) 核"
+          free -h
+          df -h
+          java -version 2>&1 | head -3
+          python3 --version
+          ninja --version || echo "ninja 未安装"
+          ccache --version | head -1 || echo "ccache 未安装"
+
+      # --- 1. 检出 Kiwi 增量源码 ---
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: kiwi
+
+      # --- 2. 建立 Chromium 工作区（仅首次） ---
+      - name: 准备 Chromium 工作区
+        run: |
+          WORKSPACE="$GITHUB_WORKSPACE/../chromium_build"
+          echo "WORKSPACE=$WORKSPACE" >> $GITHUB_ENV
+          echo "OUT_DIR=$WORKSPACE/out/android_arm64" >> $GITHUB_ENV
+
+          if [[ ! -d "$WORKSPACE/src" ]]; then
+            echo "==> 首次构建：初始化工作区"
+            mkdir -p "$WORKSPACE"
+            cd "$WORKSPACE"
+
+            # depot_tools
+            if [[ ! -d "$WORKSPACE/depot_tools" ]]; then
+              git clone --depth 1 \
+                https://chromium.googlesource.com/chromium/tools/depot_tools.git
+            fi
+            export PATH="$WORKSPACE/depot_tools:$PATH"
+            echo "$WORKSPACE/depot_tools" >> $GITHUB_PATH
+
+            # 拉取 Chromium（--no-history 省大量空间和时间）
+            fetch --nohooks --no-history android
+          else
+            echo "==> 复用已有工作区"
+          fi
+          echo "$WORKSPACE/depot_tools" >> $GITHUB_PATH
+
+      - name: 切换 Chromium 版本
+        run: |
+          export PATH="$WORKSPACE/depot_tools:$PATH"
+          cd "$WORKSPACE/src"
+          git fetch --tags --depth 1 origin tag "$CHROMIUM_VERSION" || true
+          git checkout -f "tags/$CHROMIUM_VERSION" || echo "!! 该 tag 不存在，保持当前版本"
+          git log -1 --oneline
+
+      # --- 3. 同步依赖（最耗时、最易失败的一步） ---
+      - name: gclient sync
+        run: |
+          export PATH="$WORKSPACE/depot_tools:$PATH"
+          cd "$WORKSPACE"
+          gclient sync -D --no-history --shallow \
+            --reset-on-error --retry-failures=3
+
+      - name: 安装构建钩子
+        run: |
+          export PATH="$WORKSPACE/depot_tools:$PATH"
+          cd "$WORKSPACE"
+          gclient runhooks
+
+      # --- 4. 叠加 Kiwi 定制补丁 ---
+      - name: 叠加 Kiwi 补丁
+        run: |
+          echo "==> 把 Kiwi 增量文件覆盖到 Chromium src"
+          SRC="$GITHUB_WORKSPACE"
+          DST="$WORKSPACE/src"
+
+          # Kiwi 仓库只存改动的文件，直接 rsync 覆盖
+          # 排除仓库元数据和构建脚本
+          rsync -av --progress \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.build' \
+            --exclude='CHROMIUM_VERSION' \
+            --exclude='KIWI_VERSION' \
+            --exclude='README.md' \
+            --exclude='LICENSE' \
+            --exclude='*.svg' \
+            "$SRC"/ "$DST"/
+
+      # --- 5. 生成签名密钥 ---
+      - name: 生成 keystore
+        run: |
+          KS="$GITHUB_WORKSPACE/keystore.jks"
+          if [[ ! -f "$KS" ]]; then
+            keytool -genkeypair -v \
+              -keystore "$KS" \
+              -alias kiwi \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass kiwi123456 -keypass kiwi123456 \
+              -dname "CN=${{ github.event.inputs.appLabel }}, OU=Self, O=Self, L=CN, C=CN"
+          fi
+          echo "keystore 就绪: $KS"
+
+      # --- 6. 生成 GN 构建参数 ---
+      - name: 清理旧产物（可选）
+        if: ${{ github.event.inputs.cleanBuild == 'true' }}
+        run: |
+          echo "==> 清理构建产物与 ccache"
+          rm -rf "$OUT_DIR"
+          rm -rf "$CCACHE_DIR"
+
+      - name: 生成 args.gn
+        run: |
+          cd "$WORKSPACE"
+          mkdir -p "$OUT_DIR"
+
+          {
+            echo 'target_os = "android"'
+            echo 'target_cpu = "arm64"'
+            echo 'is_debug = false'
+            echo 'is_java_debug = false'
+            echo ''
+            echo 'android_channel = "dev"'
+            echo 'is_official_build = true'
+            echo 'is_component_build = false'
+            echo 'is_chrome_branded = false'
+            echo 'is_clang = true'
+            echo 'symbol_level = 1'
+            echo 'exclude_unwind_tables = false'
+            echo ''
+            echo 'use_unofficial_version_number = false'
+            echo 'android_default_version_code = "1"'
+            echo 'android_default_version_name = "Git"'
+            echo ''
+            echo '# 包名（避免与官方 Kiwi 冲突）'
+            echo 'chrome_public_manifest_package = "${{ github.event.inputs.packageName }}"'
+            echo ''
+            echo '# 签名'
+            echo 'android_keystore_name = "kiwi"'
+            echo 'android_keystore_password = "kiwi123456"'
+            echo 'android_keystore_path = "../../keystore.jks"'
+            echo ''
+            echo '# 功能开关'
+            echo 'enable_extensions = true'
+            echo 'enable_pdf = false'
+            echo 'enable_plugins = false'
+            echo 'enable_nacl = false'
+            echo 'enable_widevine = true'
+            echo 'enable_remoting = false'
+            echo 'enable_mse_mpeg2ts_stream_parser = true'
+            echo 'rtc_use_h264 = false'
+            echo ''
+            echo 'proprietary_codecs = true'
+            echo 'ffmpeg_branding = "Chrome"'
+            echo ''
+            echo 'google_api_key = "KIWIBROWSER"'
+            echo 'google_default_client_id = "42.apps.kiwibrowser.com"'
+            echo 'google_default_client_secret = "KIWIBROWSER_NOT_SO_SECRET"'
+            echo 'use_official_google_api_keys = false'
+            echo ''
+            echo 'v8_use_external_startup_data = true'
+            echo 'disable_android_lint = true'
+            echo 'treat_warnings_as_errors = false'
+            echo 'icu_use_data_file = false'
+            echo 'enable_iterator_debugging = false'
+            echo 'fieldtrial_testing_like_official_build = true'
+            echo ''
+            echo 'cc_wrapper = "ccache"'
+          } > "$OUT_DIR/args.gn"
+
+          echo "===== 最终 args.gn ====="
+          cat "$OUT_DIR/args.gn"
+
+      # --- 7. 生成构建文件 ---
+      - name: gn gen
+        run: |
+          export PATH="$WORKSPACE/depot_tools:$PATH"
+          cd "$WORKSPACE"
+          gn gen "$OUT_DIR"
+
+      # --- 8. 编译 ---
+      - name: 编译 chrome_public_apk
+        run: |
+          export PATH="$WORKSPACE/depot_tools:$PATH"
+          cd "$WORKSPACE"
+          NPROC=$(nproc)
+          echo "==> 使用 $NPROC 核编译"
+          autoninja -C "$OUT_DIR" -j "$NPROC" chrome_public_apk
+
+      # --- 9. 产物收集 ---
+      - name: 收集 APK
+        run: |
+          cd "$WORKSPACE"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          find "$OUT_DIR/apks" -name "*.apk" -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \;
+          ls -lh "$GITHUB_WORKSPACE/artifacts/"
+          df -h
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiwi-arm64-apk
+          path: ${{ github.workspace }}/artifacts/*.apk
+          retention-days: 30
+
+      # --- 10. 创建 Release ---
+      - name: 创建 Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_id }}
+          name: KiwiX Build ${{ github.run_id }}
+          draft: false
+          prerelease: true
+          body: |
+            ## 自建 Kiwi 浏览器
+            - **Chromium 版本**: ${{ github.event.inputs.chromiumVersion }}
+            - **包名**: ${{ github.event.inputs.packageName }}
+            - **架构**: arm64-v8a
+            - **运行**: #${{ github.run_number }}
+
+            安装说明：下载 `.apk` 文件传到手机安装。若提示"未知来源"，到
+            设置 → 应用设置 → 授权管理 中允许安装。
+          files: ${{ github.workspace }}/artifacts/*.apk
+          token: ${{ secrets.GITHUB_TOKEN }}
