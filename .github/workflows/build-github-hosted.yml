@@ -224,11 +224,18 @@ jobs:
              'if (enable_extensions && !is_android) {\n    deps += [ "//extensions/shell:unit_tests" ]\n  }'),
           ], 'extensions/BUILD.gn')
 
-          # --- chrome/test/BUILD.gn: 一处（第 308 行的 enable_extensions 块）---
-          # 该块以 sources += [ 开头，用块首行做唯一锚点
+          # --- chrome/test/BUILD.gn: 两处 ---
+          # 修补 3: 第 308 行 test_support 内的 enable_extensions 块
+          #   （引用 //chrome/browser/apps/app_service 与 //apps:test_support）
+          # 修补 6: 第 8511 行 unit_tests 内的 enable_extensions 块
+          #   （引用 //chrome/browser/ui/global_error、//ui/web_dialogs、//apps/ui/views）
+          # 其余 if(enable_extensions)（1404/3916/10259/10377/10729/11927）
+          # 均在 if(!is_android) 或 if(is_chromeos_ash) 的 target 内，安卓下不会展开，无需处理。
           apply('chrome/test/BUILD.gn', [
             ('  if (enable_extensions) {\n    sources += [\n      "../browser/apps/platform_apps/app_browsertest_util.cc",',
              '  if (enable_extensions && !is_android) {\n    sources += [\n      "../browser/apps/platform_apps/app_browsertest_util.cc",'),
+            ('  # TODO(crbug.com/1229899): Clean up and move this to a separate target.\n  if (enable_extensions) {\n    sources += [\n      "../../apps/saved_files_service_unittest.cc",',
+             '  # TODO(crbug.com/1229899): Clean up and move this to a separate target.\n  if (enable_extensions && !is_android) {\n    sources += [\n      "../../apps/saved_files_service_unittest.cc",'),
           ], 'chrome/test/BUILD.gn')
 
           # --- 根 BUILD.gn: 一处（gn_all 里的 enable_extensions 块）---
