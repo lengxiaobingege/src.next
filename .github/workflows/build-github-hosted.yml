@@ -192,6 +192,7 @@ jobs:
             echo ''
             echo 'android_channel = "dev"'
             echo 'is_official_build = true'
+            echo 'chrome_pgo_phase = 0'
             echo 'is_component_build = false'
             echo 'is_chrome_branded = false'
             echo 'is_clang = true'
