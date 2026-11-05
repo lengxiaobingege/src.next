@@ -147,6 +147,12 @@ jobs:
           df -h /
 
       # ================= 4. Kiwi 补丁 =================
+      - name: 检出构建配置（kiwi 分支的 args-kiwi.gn）
+        uses: actions/checkout@v4
+        with:
+          ref: kiwi
+          path: config
+
       - name: 检出 Kiwi 改动（chromium 分支 = 已 rebase 到 132 的增量）
         uses: actions/checkout@v4
         with:
@@ -184,59 +190,10 @@ jobs:
         run: |
           cd "$WORKSPACE/src"
           mkdir -p out/android_arm64
-          {
-            echo 'target_os = "android"'
-            echo 'target_cpu = "arm64"'
-            echo 'is_debug = false'
-            echo 'is_java_debug = false'
-            echo ''
-            echo 'android_channel = "dev"'
-            echo 'is_official_build = true'
-            echo 'chrome_pgo_phase = 0'
-            echo 'is_component_build = false'
-            echo 'is_chrome_branded = false'
-            echo 'is_clang = true'
-            echo 'symbol_level = 0'
-            echo 'exclude_unwind_tables = true'
-            echo 'blink_symbol_level = 0'
-            echo ''
-            echo 'use_unofficial_version_number = false'
-            echo 'android_default_version_code = "1"'
-            echo 'android_default_version_name = "KiwiX"'
-            echo ''
-            echo 'chrome_public_manifest_package = "${{ github.event.inputs.packageName }}"'
-            echo ''
-            echo 'android_keystore_name = "kiwi"'
-            echo 'android_keystore_password = "kiwi123456"'
-            echo 'android_keystore_path = "../../keystore.jks"'
-            echo ''
-            echo 'enable_extensions = true'
-            echo 'enable_guest_view = true'
-            echo 'enable_pdf = false'
-            echo 'enable_plugins = false'
-            echo 'enable_nacl = false'
-            echo 'enable_widevine = false'
-            echo 'enable_remoting = false'
-            echo 'enable_mse_mpeg2ts_stream_parser = false'
-            echo 'rtc_use_h264 = false'
-            echo ''
-            echo 'proprietary_codecs = false'
-            echo 'ffmpeg_branding = "Chromium"'
-            echo ''
-            echo 'google_api_key = "KIWIBROWSER"'
-            echo 'google_default_client_id = "42.apps.kiwibrowser.com"'
-            echo 'google_default_client_secret = "KIWIBROWSER_NOT_SO_SECRET"'
-            echo 'use_official_google_api_keys = false'
-            echo ''
-            echo 'v8_use_external_startup_data = true'
-            echo 'disable_android_lint = true'
-            echo 'treat_warnings_as_errors = false'
-            echo 'icu_use_data_file = false'
-            echo 'enable_iterator_debugging = false'
-            echo 'fieldtrial_testing_like_official_build = true'
-            echo ''
-            echo 'cc_wrapper = "ccache"'
-          } > out/android_arm64/args.gn
+          cp "$GITHUB_WORKSPACE/config/args-kiwi.gn" out/android_arm64/args.gn
+          sed -i "s|__PKG__|${{ github.event.inputs.packageName }}|" out/android_arm64/args.gn
+          echo "===== args.gn ====="
+          cat out/android_arm64/args.gn
           cat out/android_arm64/args.gn
 
       - name: gn gen
