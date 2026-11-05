@@ -1,0 +1,289 @@
+# 在 GitHub 官方 runner 上构建 Kiwi (arm64)
+# =============================================================================
+# 设计依据：作者原版 build_and_sign_release_apk.yml 就是跑在 ubuntu-latest 上的
+# 关键技巧（学自作者）：
+#   1. 关闭 swap + 删除 .NET 腾出根盘空间
+#   2. 把 14GB 临时 SSD (/mnt) 当作构建输出盘
+#   3. 用 actions/cache 缓存 gclient 依赖和 ccache，跨次构建复用
+# 差异：
+#   - 只编 arm64（省 75%）
+#   - symbol_level=0（省 20-30%）
+#   - JDK 17（Chromium 137 要求，作者用 JDK 8 是错的）
+# =============================================================================
+
+name: 'Kiwi: GitHub-hosted Build arm64'
+
+on:
+  workflow_dispatch:
+    inputs:
+      packageName:
+        description: 'APK 包名'
+        required: true
+        default: 'com.lengxiaobing.kiwi'
+      appLabel:
+        description: 'APP 显示名称'
+        required: true
+        default: 'KiwiX'
+      chromiumVersion:
+        description: 'Chromium tag（如 137.0.7337.0，留空则用默认分支最新）'
+        required: false
+        default: '137.0.7337.0'
+      useCache:
+        description: '启用依赖缓存（首次 false，后续 true）'
+        required: true
+        default: 'false'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350          # 官方上限 360 分钟，留 10 分钟余量
+
+    steps:
+      # ---------- 1. 磁盘腾挪 ----------
+      - name: 释放根盘空间
+        run: |
+          echo "=== 清理前 ==="
+          df -h /
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android/sdk/ndk || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/lib/node_modules || true
+          sudo apt-get clean
+          echo "=== 清理后 ==="
+          df -h /
+
+      - name: 挂载临时 SSD 作为构建盘
+        run: |
+          # GitHub runner 有约 14GB 的 /mnt 临时盘
+          sudo mkdir -p /mnt/build
+          sudo chown -R $USER:$USER /mnt/build
+          df -h /mnt || true
+
+      # ---------- 2. 环境准备 ----------
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 python3-pip python3-venv \
+            openjdk-17-jdk-headless \
+            ccache ninja-build pkg-config \
+            libnss3-dev libglib2.0-dev
+          java -version
+          python3 --version
+          ninja --version
+
+      - name: 配置 ccache
+        run: |
+          ccache --max-size=2G
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: 缓存 ccache
+        if: ${{ github.event.inputs.useCache == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-kiwi-${{ github.run_id }}
+          restore-keys: ccache-kiwi-
+
+      # ---------- 3. depot_tools ----------
+      - name: 安装 depot_tools
+        run: |
+          cd /mnt/build
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "/mnt/build/depot_tools" >> $GITHUB_PATH
+
+      # ---------- 4. 拉取 Chromium ----------
+      - name: 缓存 Chromium 工作区
+        if: ${{ github.event.inputs.useCache == 'true' }}
+        id: cache-chromium
+        uses: actions/cache@v4
+        with:
+          path: /mnt/build/chromium
+          key: chromium-ws-${{ github.event.inputs.chromiumVersion }}
+
+      - name: 拉取 Chromium 源码
+        if: steps.cache-chromium.outputs.cache-hit != 'true'
+        run: |
+          export PATH="/mnt/build/depot_tools:$PATH"
+          cd /mnt/build
+          mkdir -p chromium && cd chromium
+          fetch --nohooks --no-history android
+          echo "=== 拉取完成 ==="
+          df -h /mnt
+
+      - name: 切换版本并同步依赖
+        run: |
+          export PATH="/mnt/build/depot_tools:$PATH"
+          cd /mnt/build/chromium
+          if [[ -n "${{ github.event.inputs.chromiumVersion }}" ]]; then
+            cd src
+            git fetch --depth 1 origin tag "${{ github.event.inputs.chromiumVersion }}" || true
+            git checkout -f "${{ github.event.inputs.chromiumVersion }}" 2>/dev/null || \
+              git checkout -f "tags/${{ github.event.inputs.chromiumVersion }}" || \
+              echo "!! tag 不存在，使用当前版本"
+            git log -1 --oneline
+            cd ..
+          fi
+          gclient sync -D --no-history --shallow --reset-on-error --retry-failures=3
+          gclient runhooks
+
+      # ---------- 5. 叠加 Kiwi 补丁 ----------
+      - name: 检出 Kiwi 增量源码
+        uses: actions/checkout@v4
+        with:
+          ref: kiwi
+          path: kiwi-patch
+
+      - name: 应用 Kiwi 定制
+        run: |
+          cd "$GITHUB_WORKSPACE/kiwi-patch"
+          echo "=== Kiwi 补丁文件统计 ==="
+          find . -type f -not -path "./.git/*" -not -path "./.github/*" | wc -l
+
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.build' \
+            --exclude='CHROMIUM_VERSION' \
+            --exclude='KIWI_VERSION' \
+            --exclude='README.md' \
+            --exclude='LICENSE' \
+            --exclude='*.svg' \
+            "$GITHUB_WORKSPACE/kiwi-patch"/ \
+            /mnt/build/chromium/src/
+
+      # ---------- 6. 签名密钥 ----------
+      - name: 生成 keystore
+        run: |
+          cd /mnt/build/chromium
+          keytool -genkeypair -v \
+            -keystore keystore.jks \
+            -alias kiwi \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass kiwi123456 -keypass kiwi123456 \
+            -dname "CN=${{ github.event.inputs.appLabel }}, OU=Self, O=Self, L=CN, C=CN"
+          ls -lh keystore.jks
+
+      # ---------- 7. 构建参数 ----------
+      - name: 生成 args.gn
+        run: |
+          cd /mnt/build/chromium
+          mkdir -p out/android_arm64
+          {
+            echo 'target_os = "android"'
+            echo 'target_cpu = "arm64"'
+            echo 'is_debug = false'
+            echo 'is_java_debug = false'
+            echo ''
+            echo 'android_channel = "dev"'
+            echo 'is_official_build = true'
+            echo 'is_component_build = false'
+            echo 'is_chrome_branded = false'
+            echo 'is_clang = true'
+            echo 'symbol_level = 0'
+            echo 'exclude_unwind_tables = true'
+            echo 'blink_symbol_level = 0'
+            echo 'v8_symbol_level = 0'
+            echo ''
+            echo 'use_unofficial_version_number = false'
+            echo 'android_default_version_code = "1"'
+            echo 'android_default_version_name = "KiwiX"'
+            echo ''
+            echo 'chrome_public_manifest_package = "${{ github.event.inputs.packageName }}"'
+            echo ''
+            echo 'android_keystore_name = "kiwi"'
+            echo 'android_keystore_password = "kiwi123456"'
+            echo 'android_keystore_path = "../../keystore.jks"'
+            echo ''
+            echo 'enable_extensions = true'
+            echo 'enable_pdf = false'
+            echo 'enable_plugins = false'
+            echo 'enable_nacl = false'
+            echo 'enable_widevine = true'
+            echo 'enable_remoting = false'
+            echo 'enable_mse_mpeg2ts_stream_parser = true'
+            echo 'rtc_use_h264 = false'
+            echo ''
+            echo 'proprietary_codecs = true'
+            echo 'ffmpeg_branding = "Chrome"'
+            echo ''
+            echo 'google_api_key = "KIWIBROWSER"'
+            echo 'google_default_client_id = "42.apps.kiwibrowser.com"'
+            echo 'google_default_client_secret = "KIWIBROWSER_NOT_SO_SECRET"'
+            echo 'use_official_google_api_keys = false'
+            echo ''
+            echo 'v8_use_external_startup_data = true'
+            echo 'disable_android_lint = true'
+            echo 'treat_warnings_as_errors = false'
+            echo 'icu_use_data_file = false'
+            echo 'enable_iterator_debugging = false'
+            echo 'fieldtrial_testing_like_official_build = true'
+            echo ''
+            echo 'cc_wrapper = "ccache"'
+          } > out/android_arm64/args.gn
+          echo "===== args.gn ====="
+          cat out/android_arm64/args.gn
+
+      - name: gn gen
+        run: |
+          export PATH="/mnt/build/depot_tools:$PATH"
+          cd /mnt/build/chromium
+          gn gen out/android_arm64
+          echo "=== 构建目标检查 ==="
+          gn ls out/android_arm64 | grep -c "" || true
+
+      # ---------- 8. 编译 ----------
+      - name: 编译 chrome_public_apk
+        run: |
+          export PATH="/mnt/build/depot_tools:$PATH"
+          cd /mnt/build/chromium
+          echo "开始时间: $(date)"
+          df -h /mnt
+          autoninja -C out/android_arm64 -j 4 chrome_public_apk
+          echo "结束时间: $(date)"
+          echo "=== ccache 命中率 ==="
+          ccache -s || true
+
+      # ---------- 9. 产物 ----------
+      - name: 收集 APK
+        if: success()
+        run: |
+          cd /mnt/build/chromium
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          find out/android_arm64/apks -name "*.apk" -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \;
+          ls -lh "$GITHUB_WORKSPACE/artifacts/"
+
+      - name: 上传产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiwi-arm64-apk
+          path: ${{ github.workspace }}/artifacts/*.apk
+          retention-days: 30
+
+      - name: 创建 Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_id }}
+          name: KiwiX Build ${{ github.run_id }}
+          draft: false
+          prerelease: true
+          body: |
+            **自建 KiwiX** · Chromium ${{ github.event.inputs.chromiumVersion }}
+            包名 `${{ github.event.inputs.packageName }}` · arm64-v8a · 含 Chrome 扩展支持
+          files: ${{ github.workspace }}/artifacts/*.apk
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 失败时保存日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            /mnt/build/chromium/out/android_arm64/*.log
+          retention-days: 7
+          if-no-files-found: ignore
