@@ -82,7 +82,7 @@ jobs:
           fi
           if (( AVAIL < 60 )); then
             echo "::warning::磁盘仅 ${AVAIL}GB，将启用精简构建"
-            echo "LEAN_BUILD=1" >> $GITHUB_ENV
+            echo "LEAN_BUILD=1" >> "${GITHUB_ENV}"
           fi
 
       # ================= 2. 依赖 =================
@@ -183,6 +183,30 @@ jobs:
           cd "$WORKSPACE/src"
           echo "=== 改动文件数 ==="
           git status --short | wc -l
+
+          # ---------- 上游 bug 修正（不属于 Kiwi 补丁）----------
+          # 官方 132 的 extensions/BUILD.gn 第 332 行：
+          #   if (enable_extensions) {
+          #     # Browser tests are not currently supported in desktop-android builds.
+          #     test("extensions_browsertests") { ... }
+          # 注释明说安卓不支持，但漏了 !is_android 保护。
+          # 该 test 依赖 //ui/web_dialogs:test_support，
+          # 而 ui/web_dialogs/BUILD.gn:5 有 assert(!is_android) → gn gen 硬失败。
+          # chrome/test/BUILD.gn 已把 browser_tests 整体包在 if(!is_android) 内，
+          # 此处按同样意图补齐，仅影响测试目标，不影响扩展功能。
+          echo "=== 修正上游 extensions_browsertests 的 android 保护 ==="
+          python3 - <<'PY'
+          import sys
+          p = 'extensions/BUILD.gn'
+          s = open(p).read()
+          old = 'if (enable_extensions) {\n  # Browser tests are not currently supported in desktop-android builds.\n  test("extensions_browsertests") {'
+          new = 'if (enable_extensions && !is_android) {\n  # Browser tests are not currently supported in desktop-android builds.\n  test("extensions_browsertests") {'
+          if old not in s:
+              print('ERROR: 未匹配到目标代码块，请人工确认'); sys.exit(1)
+          open(p, 'w').write(s.replace(old, new, 1))
+          print('已修补 extensions/BUILD.gn')
+          PY
+          grep -n 'enable_extensions && !is_android' extensions/BUILD.gn && echo "补丁确认成功"
           df -h /
 
       # ================= 5. 签名 =================
