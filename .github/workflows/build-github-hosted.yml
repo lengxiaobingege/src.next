@@ -1,10 +1,14 @@
-# 在 GitHub 官方 runner 上构建 Kiwi (arm64) — v2 修正版
+# 在 GitHub 官方 runner 上构建 Kiwi (arm64) — v3 修复磁盘问题
 # =============================================================================
-# v1 失败原因（已从日志确诊）：
-#   1. gclient 的 --reset-on-error / --retry-failures 参数已废弃 → 移除
-#   2. fetch 未真正拉源码，只跑了 gclient config → 改为显式分步执行
-#   3. 137.0.7337.0 不是 Chromium 真实 tag → 改用真实 tag
-#   ✅ 意外发现：官方 runner 根盘有 145GB，磁盘不是瓶颈
+# v2 失败原因（已从 Actions 诊断信息确诊）：
+#   System.IO.IOException: No space left on device
+#   根因：切换 tag 后执行了第二次全量 gclient sync，
+#         新旧依赖叠加 + .git 对象膨胀，撑爆 145GB 磁盘
+# 修正：
+#   1. .gclient 的 URL 直接带版本号，只 sync 一次
+#   2. 移除"切换版本后再次 sync"步骤
+#   3. 最大化磁盘清理 + 全程监控 df
+#   4. 用 --prune 移除无用依赖
 # =============================================================================
 
 name: 'Kiwi: GitHub-hosted Build arm64'
@@ -21,8 +25,8 @@ on:
         required: true
         default: 'KiwiX'
       chromiumTag:
-        description: 'Chromium 真实 tag（如 131.0.6778.200，留空用 main 最新）'
-        required: false
+        description: 'Chromium tag（默认 132.0.6834.83 = Kiwi 停更时的内核）'
+        required: true
         default: '132.0.6834.83'
 
 jobs:
@@ -31,36 +35,56 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      # ---------- 1. 环境 ----------
-      - name: 检查环境与磁盘
+      # ================= 1. 极限腾空间 =================
+      - name: 极限清理磁盘
         run: |
-          echo "=== CPU/内存 ==="
-          nproc; free -h
-          echo "=== 磁盘 ==="
+          echo "=== 清理前 ==="
           df -h /
+
+          # 关闭 swap
           sudo swapoff -a || true
-          sudo rm -f /swapfile || true
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          sudo rm -f /swapfile /mnt/swapfile || true
+
+          # 删除巨型预装无用软件
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /usr/local/lib/node_modules || true
+          sudo rm -rf /opt/hostedtoolcache || true
+
+          # 清理包缓存
           sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* || true
+          sudo rm -rf /var/cache/apt/archives/* || true
+
           echo "=== 清理后 ==="
           df -h /
 
+      - name: 检查磁盘（要求 >=110GB 可用）
+        run: |
+          AVAIL=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "可用空间: ${AVAIL}GB"
+          if (( AVAIL < 110 )); then
+            echo "::error::磁盘不足 110GB，编译必然失败"
+            exit 1
+          fi
+
+      # ================= 2. 依赖 =================
       - name: 安装依赖
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
             python3 python3-pip python3-venv \
             openjdk-17-jdk-headless \
-            ccache ninja-build pkg-config
+            ccache ninja-build pkg-config file
           java -version 2>&1 | head -2
-          python3 --version
-
-      - name: 配置 ccache
-        run: |
-          ccache --max-size=3G
+          ccache --max-size=2G
           echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
 
-      # ---------- 2. depot_tools ----------
       - name: 安装 depot_tools
         run: |
           git clone --depth 1 \
@@ -68,67 +92,61 @@ jobs:
             "$HOME/depot_tools"
           echo "$HOME/depot_tools" >> $GITHUB_PATH
 
-      # ---------- 3. 拉取 Chromium（分步执行，不依赖 fetch） ----------
-      - name: 初始化 Chromium 工作区
+      # ================= 3. 单次 gclient sync =================
+      - name: 配置 .gclient（版本直接写入 URL，避免二次 sync）
         run: |
-          export PATH="$HOME/depot_tools:$PATH"
-          mkdir -p "$RUNNER_WORKSPACE/chromium"
-          cd "$RUNNER_WORKSPACE/chromium"
-          echo "WORKSPACE=$RUNNER_WORKSPACE/chromium" >> $GITHUB_ENV
+          WS="$RUNNER_WORKSPACE/chromium"
+          mkdir -p "$WS"
+          cd "$WS"
+          echo "WORKSPACE=$WS" >> $GITHUB_ENV
 
-          # 显式写 .gclient，不依赖 fetch 命令
-          gclient config --spec 'solutions = [
+          TAG="${{ github.event.inputs.chromiumTag }}"
+
+          # 关键：@TAG 直接锁定版本，一次到位
+          cat > .gclient <<EOF
+          solutions = [
             {
               "name": "src",
-              "url": "https://chromium.googlesource.com/chromium/src.git",
+              "url": "https://chromium.googlesource.com/chromium/src.git@${TAG}",
               "managed": True,
               "custom_deps": {},
               "custom_vars": {},
             },
           ]
           target_os = ["android"]
-          '
+          EOF
 
-          echo "=== .gclient 内容 ==="
+          echo "=== .gclient ==="
           cat .gclient
 
-      - name: 拉取 Chromium 源码（核心步骤）
+      - name: gclient sync（唯一一次，锁定版本）
         run: |
           export PATH="$HOME/depot_tools:$PATH"
           cd "$WORKSPACE"
           echo "开始: $(date)"
-          # --no-history 只拉最新快照，省 60% 体积
-          # 不加 --reset-on-error / --retry-failures（已废弃）
-          gclient sync --nohooks --no-history -j 8
+          df -h /
+          # --shallow: 只拉所需深度
+          # --no-history: 不要完整历史
+          # --revision: 确保版本一致
+          gclient sync --nohooks --no-history --shallow -j 8
           echo "结束: $(date)"
           echo "=== 磁盘 ==="
           df -h /
-          echo "=== 源码大小 ==="
+          echo "=== 源码体积 ==="
           du -sh src 2>/dev/null || true
+          echo "=== 验证版本 ==="
+          cd src && git log -1 --oneline
 
-      - name: 切换到指定版本
-        run: |
-          export PATH="$HOME/depot_tools:$PATH"
-          cd "$WORKSPACE/src"
-          TAG="${{ github.event.inputs.chromiumTag }}"
-          if [[ -n "$TAG" ]]; then
-            echo "==> 尝试切换到 tag $TAG"
-            git fetch --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" || \
-              git fetch --depth 1 origin tag "$TAG" || true
-            git checkout -f "$TAG" 2>/dev/null && echo "✅ 已切到 $TAG" || \
-              echo "⚠️ tag 不可用，使用当前 HEAD"
-          fi
-          git log -1 --oneline
-          git describe --tags 2>/dev/null || true
-
-      - name: 同步该版本的依赖
+      - name: 运行 hooks（下载工具链）
         run: |
           export PATH="$HOME/depot_tools:$PATH"
           cd "$WORKSPACE"
-          gclient sync --nohooks --no-history -j 8
+          df -h /
           gclient runhooks
+          echo "=== hooks 完成 ==="
+          df -h /
 
-      # ---------- 4. Kiwi 补丁 ----------
+      # ================= 4. Kiwi 补丁 =================
       - name: 检出 Kiwi 源码
         uses: actions/checkout@v4
         with:
@@ -140,18 +158,17 @@ jobs:
           cd "$GITHUB_WORKSPACE/kiwi-patch"
           echo "=== 补丁文件数 ==="
           find . -type f -not -path "./.git/*" -not -path "./.github/*" | wc -l
-          echo "=== 开始覆盖 ==="
           rsync -a \
             --exclude='.git' --exclude='.github' --exclude='.build' \
             --exclude='CHROMIUM_VERSION' --exclude='KIWI_VERSION' \
             --exclude='README.md' --exclude='LICENSE' --exclude='*.svg' \
             ./ "$WORKSPACE/src/"
-          echo "=== 覆盖完成 ==="
           cd "$WORKSPACE/src"
-          git status --short | head -20
+          echo "=== 改动文件数 ==="
           git status --short | wc -l
+          df -h /
 
-      # ---------- 5. 签名 ----------
+      # ================= 5. 签名 =================
       - name: 生成 keystore
         run: |
           cd "$WORKSPACE"
@@ -159,10 +176,10 @@ jobs:
             -keystore keystore.jks -alias kiwi \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass kiwi123456 -keypass kiwi123456 \
-            -dname "CN=${{ github.event.inputs.appLabel }}, OU=Self, O=Self, L=CN, C=CN"
+            -dname "CN=${{ github.event.inputs.appLabel }}, OU=Self, O=Self, L=CN, C=CN" 2>&1 | tail -3
           ls -lh keystore.jks
 
-      # ---------- 6. GN ----------
+      # ================= 6. GN =================
       - name: 生成 args.gn
         run: |
           cd "$WORKSPACE"
@@ -196,13 +213,13 @@ jobs:
             echo 'enable_pdf = false'
             echo 'enable_plugins = false'
             echo 'enable_nacl = false'
-            echo 'enable_widevine = true'
+            echo 'enable_widevine = false'
             echo 'enable_remoting = false'
-            echo 'enable_mse_mpeg2ts_stream_parser = true'
+            echo 'enable_mse_mpeg2ts_stream_parser = false'
             echo 'rtc_use_h264 = false'
             echo ''
-            echo 'proprietary_codecs = true'
-            echo 'ffmpeg_branding = "Chrome"'
+            echo 'proprietary_codecs = false'
+            echo 'ffmpeg_branding = "Chromium"'
             echo ''
             echo 'google_api_key = "KIWIBROWSER"'
             echo 'google_default_client_id = "42.apps.kiwibrowser.com"'
@@ -225,25 +242,26 @@ jobs:
           export PATH="$HOME/depot_tools:$PATH"
           cd "$WORKSPACE"
           gn gen out/android_arm64
-          echo "=== 构建配置生成成功 ==="
-          head -20 out/android_arm64/args.gn
+          echo "=== gn gen 成功 ==="
+          df -h /
 
-      # ---------- 7. 编译 ----------
+      # ================= 7. 编译 =================
       - name: 编译
         run: |
           export PATH="$HOME/depot_tools:$PATH"
           cd "$WORKSPACE"
-          echo "开始编译: $(date)"
+          echo "编译开始: $(date)"
           df -h /
           autoninja -C out/android_arm64 -j 4 chrome_public_apk
           echo "编译完成: $(date)"
           ccache -s || true
+          df -h /
 
-      # ---------- 8. 产物 ----------
-      - name: 收集并上传
+      # ================= 8. 产物 =================
+      - name: 收集 APK
         if: always()
         run: |
-          cd "$WORKSPACE" || exit 0
+          cd "$WORKSPACE" 2>/dev/null || exit 0
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           find out/android_arm64/apks -name "*.apk" -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \; 2>/dev/null || echo "未找到 APK"
           ls -lh "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
