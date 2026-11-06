@@ -271,10 +271,22 @@ jobs:
             ('assert(!is_android && !is_ios)',
              'assert(!is_ios)'),
           ], 'apps/BUILD.gn')
+
+          # --- chrome/browser/ui/apps/BUILD.gn: 放宽 assert（修补 8）---
+          # chrome/browser/extensions 的 extensions target 顶层无条件依赖
+          #   //chrome/browser/ui/apps（第 755 行），无法绕开。
+          # 该 target 的 sources 全是 .h 头文件（不参与编译），public_deps
+          #   （base/extensions/ui base/gfx）均为安卓支持的跨平台模块。
+          # 实际的 .cc 实现（views 对话框）在另一个 :impl target 里，安卓不引用。
+          # 放宽 assert：把「桌面平台白名单」改为「仅排除 iOS」。
+          apply('chrome/browser/ui/apps/BUILD.gn', [
+            ('assert(is_win || is_mac || is_linux || is_chromeos)',
+             'assert(!is_ios)'),
+          ], 'chrome/browser/ui/apps/BUILD.gn')
           PY
           echo "=== 校验 ==="
           grep -c 'enable_extensions && !is_android' extensions/BUILD.gn chrome/test/BUILD.gn BUILD.gn
-          grep -n 'assert(!is_ios)' apps/BUILD.gn
+          grep -n 'assert(!is_ios)' apps/BUILD.gn chrome/browser/ui/apps/BUILD.gn
           df -h /
 
       # ================= 5. 签名 =================
