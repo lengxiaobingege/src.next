@@ -108,12 +108,15 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt-get update -qq
-          # Chromium 105 时代的工具链要求：JDK 11/17 均可，py3 必须有
+          # 必需包：一个都不能少，缺了要显式失败，绝不能用 || true 掩盖
+          # （apt 是整批原子安装，混入一个不存在的包会导致整批不装）
           sudo apt-get install -y -qq \
             python3 python3-pip python3-venv \
             openjdk-17-jdk-headless \
-            ccache ninja-build pkg-config file \
-            libnss3-dev libgconf-2-4 libpci3 || true
+            ccache ninja-build pkg-config file
+          # 可选运行时库：新版 runner 可能已移除，装不上不影响编译
+          # libgconf-2-4 在 ubuntu-24.04 已删除，不放入必需清单
+          sudo apt-get install -y -qq libnss3-dev libpci3 || true
           java -version 2>&1 | head -2
           python3 --version
           ccache --max-size=2G
