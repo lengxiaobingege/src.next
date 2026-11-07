@@ -139,6 +139,13 @@ jobs:
 
           TAG="${{ github.event.inputs.chromiumTag }}"
 
+          # custom_vars 关闭 traffic_annotation_auditor 下载 hook。
+          # 该二进制仅用于「网络流量标注审计」，编译 Android APK 完全不需要；
+          # 且 105 时代它对应的 GCS 对象已被 Google 从存储桶删除，
+          # runhooks 会报 "No URLs matched" 并整体失败（exit 2）。
+          # 105 的 DEPS 里变量名是 checkout_traffic_annotation_tools，
+          # hook 条件为 host_os == "linux" and checkout_traffic_annotation_tools，
+          # 设为 False 即可精准跳过，不影响其他任何 hook。
           cat > .gclient <<EOF
           solutions = [
             {
@@ -146,7 +153,9 @@ jobs:
               "url": "https://chromium.googlesource.com/chromium/src.git@${TAG}",
               "managed": True,
               "custom_deps": {},
-              "custom_vars": {},
+              "custom_vars": {
+                "checkout_traffic_annotation_tools": False,
+              },
             },
           ]
           target_os = ["android"]
@@ -175,8 +184,21 @@ jobs:
           export PATH="$HOME/depot_tools:$PATH"
           cd "$WORKSPACE"
           df -h /
-          gclient runhooks
-          echo "=== hooks 完成 ==="
+          # 步骤默认是 bash -e：runhooks 一旦非 0 会立即终止，后面的护栏根本跑不到。
+          # 因此显式捕获退出码，把裁决权交给「编译必需组件」校验：
+          #   - 非必需的老 GCS 对象失效 → 放行（记录警告）
+          #   - 但编译必需的工具链缺失   → 明确失败，绝不掩盖
+          RC=0
+          gclient runhooks || RC=$?
+          echo "=== runhooks 退出码: ${RC} ==="
+          if [ "${RC}" -ne 0 ]; then
+            echo "::warning::runhooks 返回非 0，仅当编译必需组件齐全时放行"
+          fi
+          echo "=== 校验编译必需组件（缺任一个即失败）==="
+          test -f src/third_party/llvm-build/Release+Asserts/bin/clang && echo "OK clang" || { echo "::error::clang 缺失"; exit 1; }
+          test -d src/build/linux/debian_bullseye_amd64-sysroot && echo "OK sysroot" || { echo "::error::sysroot 缺失"; exit 1; }
+          test -f src/third_party/node/linux/node-linux-x64/bin/node && echo "OK node" || { echo "::error::node 缺失"; exit 1; }
+          echo "=== hooks 阶段完成 ==="
           df -h /
 
       # ================= 4. 应用 Kiwi overlay =================
