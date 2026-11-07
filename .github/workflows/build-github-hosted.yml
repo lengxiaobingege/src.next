@@ -339,8 +339,33 @@ jobs:
                   sys.exit(1)
               s = s.replace(old, new, 1)
               print("OK 裁剪: " + new.splitlines()[0].strip())
+          # 更彻底的一步：gn_all 全量清单共 788 行，会不断拉进新的桌面
+          # 测试目标（guest_view / extensions_shell / chrome_test ...），
+          # 逐处切断没有尽头。安卓构建并不需要这些测试目标，APK 由
+          # traffic_annotation_auditor_dependencies(is_android) 独立可达。
+          # 故把整个 gn_all 按平台短路：安卓下只保留 APK 入口，
+          # 原内容原样放进 else（非安卓行为完全不变）。
+          lines = s.splitlines(keepends=True)
+          try:
+              start = next(i for i, l in enumerate(lines)
+                           if l.startswith('group("gn_all")'))
+              end = next(i for i in range(start + 1, len(lines))
+                         if lines[i].rstrip("\r\n") == "}")
+          except StopIteration:
+              print("::error::未定位到 gn_all 边界，拒绝继续")
+              sys.exit(1)
+          body = lines[start + 1:end]
+          wrapped = (["  if (is_android) {\n",
+                      "    # 安卓只生成 APK 依赖链，跳过全量桌面测试目标\n",
+                      "    deps = [ \"//chrome/android:chrome_public_apk\" ]\n",
+                      "  } else {\n"]
+                     + body + ["  }\n"])
+          lines[start + 1:end] = wrapped
+          s = "".join(lines)
+          print("=== gn_all 按平台短路：安卓 %d 行 -> 3 行 ===" % len(body))
+
           open(p, "w").write(s)
-          print("=== 根 BUILD.gn 两处入口已切断 ===")
+          print("=== 根 BUILD.gn 裁剪完成 ===")
 
           # 诊断：全树扫描并把仍引用 extensions/shell 的 BUILD.gn 写进日志，
           # 若 GN 后续还报桌面链，可据此一次看清剩余入口。
@@ -366,8 +391,46 @@ jobs:
         run: |
           export PATH="$HOME/depot_tools:$PATH"
           cd "$WORKSPACE/src"
-          gn gen out/android_arm64
-          echo "=== gn gen 成功 ==="
+          python3 - <<'PYEOF'
+          import re
+          import subprocess
+          import sys
+
+          # 兜底：gn_all 已按平台短路，但个别顶层 group 仍可能拉入桌面
+          # 组件。只对「桌面组件被拉进安卓」这一类断言做精确切断：
+          # 依据 GN 日志里的 See //X/BUILD.gn:N，注释掉那一条 deps 引用，
+          # 然后重试。所有改动都写入日志可审计；非此类错误一律原样失败。
+          for attempt in range(1, 9):
+              r = subprocess.run(["gn", "gen", "out/android_arm64"],
+                                 capture_output=True, text=True)
+              out = r.stdout + r.stderr
+              print(out, flush=True)
+              if r.returncode == 0:
+                  print("=== gn gen 成功（第 %d 轮）===" % attempt)
+                  sys.exit(0)
+              if "Assertion failed" not in out or "assert(!is_android" not in out:
+                  print("::error::非平台断言类错误，不自动改写，停止")
+                  sys.exit(1)
+              m = re.search(r"See (//[^:]+/BUILD\.gn):(\d+):(\d+): which caused", out)
+              if not m:
+                  print("::error::无法从日志解析引用点，停止")
+                  sys.exit(1)
+              fp, lineno = m.group(1).lstrip("/"), int(m.group(2))
+              ls = open(fp).read().splitlines(keepends=True)
+              if lineno > len(ls):
+                  print("::error::引用行号越界，停止")
+                  sys.exit(1)
+              orig = ls[lineno - 1]
+              if '"//' not in orig:
+                  print("::error::引用行不是 GN deps 条目，拒绝改写: " + repr(orig))
+                  sys.exit(1)
+              ls[lineno - 1] = "  # [android-cut] " + orig.lstrip()
+              open(fp, "w").write("".join(ls))
+              print("=== 第 %d 轮切断 %s:%d -> %s ===" %
+                    (attempt, fp, lineno, orig.strip()), flush=True)
+          print("::error::超过自动重试上限（8 轮），停止")
+          sys.exit(1)
+          PYEOF
           df -h /
 
       # ================= 7. 编译 =================
