@@ -266,6 +266,68 @@ jobs:
           echo "OK: 已替换为 Kiwi 裁剪版"
           grep -c 'enable_extensions' chrome/browser/extensions/BUILD.gn || true
 
+      # ============ 4.5 静态消除桌面 BUILD.gn 平台断言（构建前一次性）============
+      # 根因（run42367227588 / run42372288551 两轮完整日志 + 上游/overlay diff 核实）：
+      #   kiwi 分支是稀疏 overlay（顶层仅 22 项）；官方编译用的是「Kiwi 已把
+      #   所有 BUILD.gn 断言改好」的完整源码树，官方 CI workflow 本身根本不 gn gen
+      #   （只生成 args.gn，再 rclone 下载 buildbot 预编译产物）。本构建用上游
+      #   105 镜像 + overlay 拼装，overlay 又用 "|| true" 强行把桌面 WebUI 资源
+      #   引入安卓，于是上游残留的顶层平台断言必然触发。
+      # 修复：gn gen 之前一次性全局注释所有 BUILD.gn 里的「顶层纯平台断言」，
+      #   等价于还原官方源码树；打印完整清单，命中过少即拒绝继续。
+      #   运行时循环改写（上一版空转 80 轮未落盘一次）已废弃。
+      - name: 静态消除桌面 BUILD.gn 平台断言
+        run: |
+          cd "$WORKSPACE/src"
+          python3 - <<'PYEOF'
+          import os, re, sys
+
+          PLATFORM = ("is_chromeos_lacros", "is_chromeos_ash", "is_desktop_android",
+                      "is_chromeos", "is_android", "is_fuchsia", "is_castos",
+                      "is_linux", "is_mac", "is_win", "is_ios", "is_posix",
+                      "is_apple", "is_bsd", "toolkit_views", "use_aura")
+          PAT = re.compile(r"^assert\(([^)]*)\)\s*$")
+
+          def is_platform_expr(expr):
+              # 兼容 assert(平台表达式, "message")：只判断第一个逗号前的条件部分
+              core = expr.split(",")[0]
+              tmp = core
+              for kw in PLATFORM:
+                  tmp = tmp.replace(kw, "")
+              tmp = re.sub(r"[\s!&|()]", "", tmp)
+              return tmp == "" and any(k in core for k in PLATFORM)
+
+          changed = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in (".git", "out")]
+              for fn in files:
+                  if fn != "BUILD.gn":
+                      continue
+                  fp = os.path.join(root, fn)
+                  try:
+                      lines = open(fp, errors="ignore").read().splitlines(keepends=True)
+                  except OSError:
+                      continue
+                  hit = 0
+                  for i, l in enumerate(lines):
+                      m = PAT.match(l.strip())
+                      if m and is_platform_expr(m.group(1)):
+                          lines[i] = "  # [android-cut] " + l.lstrip()
+                          hit += 1
+                  if hit:
+                      open(fp, "w").write("".join(lines))
+                      changed.append((fp[2:], hit))
+
+          changed.sort()
+          total = sum(h for _, h in changed)
+          print("=== 顶层平台断言改写：%d 个文件 / %d 处 ===" % (len(changed), total), flush=True)
+          for fp, h in changed:
+              print("   %-70s %d 处" % (fp, h), flush=True)
+          if len(changed) < 15:
+              print("::error::仅命中 %d 个文件（应 >=15），源码树或规则异常，拒绝继续" % len(changed))
+              sys.exit(1)
+          PYEOF
+
       # ================= 5. 签名 =================
       - name: 生成 keystore
         run: |
@@ -410,120 +472,9 @@ jobs:
         run: |
           export PATH="$HOME/depot_tools:$PATH"
           cd "$WORKSPACE/src"
-          python3 - <<'PYEOF'
-          import re
-          import subprocess
-          import sys
-          
-          # 兜底：Kiwi overlay 用 "|| true" / "if (true)" 强行把桌面 WebUI 资源
-          # 引入安卓构建，但 overlay 不含配套 BUILD.gn（HTTP 404 已核实），
-          # rsync 后这些文件仍是 105 上游版本，顶层平台断言必然触发。
-          # 逐行注释 deps 是打地鼠：同一文件被多处引用，run42367227588
-          # 跑满 42 轮仍在同一批文件间循环。正确做法是直接解除报错文件自身的
-          # 平台断言 —— 该文件被 overlay 明确要求参与构建，断言只是「本不该在
-          # 安卓编译」的声明，移除后一轮即可彻底解决一个文件的全部引用点。
-          #   策略 1（优先）注释报错文件自身的平台断言（肯定式/否定式均可）；
-          #   策略 2        断言行无法安全改写时，再断开 GN 报告的 deps 引用点。
-          # 已处理位置会记录，同一位置重复报错立即停止，避免死循环。
-          # 非平台断言、语法错误等一律原样失败并打印完整输出。
-          MAX = 80
-          PLATFORM_KW = ("is_android", "is_chromeos", "is_chromeos_ash", "is_win",
-                         "is_mac", "is_linux", "is_ios", "is_fuchsia", "is_castos",
-                         "toolkit_views", "use_aura", "is_desktop_android")
-          handled = set()
-          
-          
-          def brief(out):
-              keys = ("ERROR at", "Assertion failed", "assert(", "See //",
-                      "which caused", "Undefined", "I/O error", "Could not")
-              return "\n".join(l for l in out.splitlines() if any(k in l for k in keys))
-          
-          
-          for attempt in range(1, MAX + 1):
-              r = subprocess.run(["gn", "gen", "out/android_arm64"],
-                                 capture_output=True, text=True)
-              out = r.stdout + r.stderr
-              print("--- gn gen 第 %d 轮 ---" % attempt, flush=True)
-              print(brief(out), flush=True)
-              if r.returncode == 0:
-                  print("=== gn gen 成功（第 %d 轮）===" % attempt)
-                  sys.exit(0)
-              if "Assertion failed" not in out:
-                  print("::error::非断言类错误，不自动改写，停止")
-                  print(out, flush=True)
-                  sys.exit(1)
-          
-              am = re.search(r"\bassert\(([^)]*)\)", out)
-              if not am or not any(k in am.group(1) for k in PLATFORM_KW):
-                  print("::error::断言非平台类，不自动改写，停止")
-                  print(out, flush=True)
-                  sys.exit(1)
-              expr = am.group(1)
-          
-              em = re.search(r"ERROR at (//[^:]+):(\d+):(\d+): Assertion failed", out)
-              sm = re.search(r"See (//[^:]+):(\d+):(\d+): which caused", out)
-              if not em:
-                  print("::error::无法定位断言文件，停止")
-                  print(out, flush=True)
-                  sys.exit(1)
-              err_fp, err_ln = em.group(1).lstrip("/"), int(em.group(2))
-          
-          # 策略 1（优先）：直接解除报错文件自身的平台断言。断言只是声明
-          # 「本文件不该在安卓编译」，而 overlay 明确要求它参与构建，移除后
-          # 一个文件的所有引用点一次性全部通过，不再打地鼠。
-          done = False
-          key = (err_fp, err_ln)
-          try:
-              es = open(err_fp).read().splitlines(keepends=True)
-          except OSError:
-              es = None
-          if es and 1 <= err_ln <= len(es):
-              line = es[err_ln - 1]
-              st = line.strip()
-              if st.startswith("assert(") and any(k in expr for k in PLATFORM_KW):
-                  if key in handled:
-                      print("::error::同一断言重复报错，改写未生效，停止")
-                      print(out, flush=True)
-                      sys.exit(1)
-                  es[err_ln - 1] = "  # [android-cut] " + line.lstrip()
-                  open(err_fp, "w").write("".join(es))
-                  handled.add(key)
-                  print("=== 第 %d 轮[解除文件断言] %s:%d -> %s" % (attempt, err_fp, err_ln, st), flush=True)
-                  done = True
-          
-          # 策略 2：断言行不是 assert(...)（如跨行断言）时，退回注释 deps 引用点。
-          if not done and sm:
-              fp, lineno = sm.group(1).lstrip("/"), int(sm.group(2))
-              try:
-                  ls = open(fp).read().splitlines(keepends=True)
-              except OSError:
-                  ls = None
-              if ls and 1 <= lineno <= len(ls):
-                  st = ls[lineno - 1].strip()
-                  is_dep = (not st.startswith("#")
-                            and st.startswith('"')
-                            and (st.endswith('",') or st.endswith('"'))
-                            and (("//" in st) or (":" in st)))
-                  if is_dep:
-                      k2 = (fp, lineno)
-                      if k2 in handled:
-                          print("::error::同一 deps 重复报错，断链未生效，停止")
-                          print(out, flush=True)
-                          sys.exit(1)
-                      ls[lineno - 1] = "  # [android-cut] " + ls[lineno - 1].lstrip()
-                      open(fp, "w").write("".join(ls))
-                      handled.add(k2)
-                      print("=== 第 %d 轮[断链] %s:%d -> %s" % (attempt, fp, lineno, st), flush=True)
-                      done = True
-          
-          if not done:
-              print("::error::平台断言但无法安全改写（断言行非 assert / 引用行非 deps），停止")
-              print(out, flush=True)
-              sys.exit(1)
-          
-          print("::error::超过自动重试上限（%d 轮），停止" % MAX)
-          sys.exit(1)
-          PYEOF
+          echo "=== gn gen（单次执行；源码已在「静态消除平台断言」步骤改写完成）==="
+          gn gen out/android_arm64
+          echo "=== gn gen 成功 ==="
           df -h /
 
       # ================= 7. 编译 =================
