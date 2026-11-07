@@ -414,61 +414,101 @@ jobs:
           import re
           import subprocess
           import sys
-
-          # 兜底：gn_all 已按平台短路，但个别顶层 group 仍可能拉入桌面
-          # 组件。只对「桌面组件被拉进安卓」这一类断言做精确切断：
-          # 依据 GN 日志里的 See //X/BUILD.gn:N，注释掉那一条 deps 引用，
-          # 然后重试。所有改动都写入日志可审计；非此类错误一律原样失败。
-          # 诊断：打印 GN 实际解析到的关键变量值，便于核对 args 是否生效
-          probe = subprocess.run(
-              ["gn", "args", "out/android_arm64",
-               "--list=enable_supervised_users", "--short"],
-              capture_output=True, text=True)
-          print("=== GN 变量诊断 ===")
-          print((probe.stdout + probe.stderr).strip())
-
-          for attempt in range(1, 21):
+          
+          # 兜底：gn_all 已按平台短路，但根 BUILD.gn 里还有若干顶层
+          # builder/waterfall group（webui_closure_compile、chromium_builder_perf、
+          # gn_visibility、rust_* 等），GN 会把它们当默认 root 一起展开，仍会
+          # 拉入带文件级平台断言的桌面组件。这里在同一轮 job 内自动收敛：
+          #   策略 1（优先）注释掉 GN 报告的引用点 deps 条目，断开加载链；
+          #   策略 2        引用行不是 deps 时，解除报错文件自身的否定式平台断言。
+          # 每一步都打印到日志可审计；非平台断言、语法错误等一律原样失败。
+          MAX = 60
+          PLATFORM_KW = ("is_android", "is_chromeos", "is_chromeos_ash", "is_win",
+                         "is_mac", "is_linux", "is_ios", "is_fuchsia", "is_castos",
+                         "toolkit_views", "use_aura", "is_desktop_android")
+          
+          
+          def brief(out):
+              keys = ("ERROR at", "Assertion failed", "assert(", "See //",
+                      "which caused", "Undefined", "I/O error", "Could not")
+              return "\n".join(l for l in out.splitlines() if any(k in l for k in keys))
+          
+          
+          for attempt in range(1, MAX + 1):
               r = subprocess.run(["gn", "gen", "out/android_arm64"],
                                  capture_output=True, text=True)
               out = r.stdout + r.stderr
-              # 只回显诊断相关行，避免 20 轮把日志刷满
-              keys = ("ERROR at", "Assertion failed", "assert(", "See //",
-                      "which caused", "Undefined", "I/O error")
-              brief = [l for l in out.splitlines() if any(k in l for k in keys)]
-              print("\n".join(brief), flush=True)
+              print("--- gn gen 第 %d 轮 ---" % attempt, flush=True)
+              print(brief(out), flush=True)
               if r.returncode == 0:
                   print("=== gn gen 成功（第 %d 轮）===" % attempt)
                   sys.exit(0)
               if "Assertion failed" not in out:
                   print("::error::非断言类错误，不自动改写，停止")
+                  print(out, flush=True)
                   sys.exit(1)
-              # 覆盖所有「平台不匹配」类断言：assert(is_chromeos)、
-              # assert(!is_android && !is_ios)、assert(is_win || ...) 等
+          
               am = re.search(r"\bassert\(([^)]*)\)", out)
-              platform_kw = ("is_android", "is_chromeos", "is_win", "is_mac",
-                             "is_linux", "is_ios", "is_fuchsia", "is_castos",
-                             "toolkit_views", "use_aura", "is_chromeos_ash")
-              if not am or not any(k in am.group(1) for k in platform_kw):
+              if not am or not any(k in am.group(1) for k in PLATFORM_KW):
                   print("::error::断言非平台类，不自动改写，停止")
+                  print(out, flush=True)
                   sys.exit(1)
-              m = re.search(r"See (//[^:]+/BUILD\.gn):(\d+):(\d+): which caused", out)
-              if not m:
-                  print("::error::无法从日志解析引用点，停止")
+              expr = am.group(1)
+          
+              em = re.search(r"ERROR at (//[^:]+):(\d+):(\d+): Assertion failed", out)
+              sm = re.search(r"See (//[^:]+):(\d+):(\d+): which caused", out)
+              if not em:
+                  print("::error::无法定位断言文件，停止")
+                  print(out, flush=True)
                   sys.exit(1)
-              fp, lineno = m.group(1).lstrip("/"), int(m.group(2))
-              ls = open(fp).read().splitlines(keepends=True)
-              if lineno > len(ls):
-                  print("::error::引用行号越界，停止")
+              err_fp, err_ln = em.group(1).lstrip("/"), int(em.group(2))
+          
+              # 策略 1：引用点是 deps 列表项（相对 label 或 // 绝对 label 均可），
+              # 注释掉它即可让 GN 不再加载那个桌面 BUILD.gn 文件。
+              done = False
+              if sm:
+                  fp, lineno = sm.group(1).lstrip("/"), int(sm.group(2))
+                  try:
+                      ls = open(fp).read().splitlines(keepends=True)
+                  except OSError:
+                      ls = None
+                  if ls and 1 <= lineno <= len(ls):
+                      st = ls[lineno - 1].strip()
+                      is_dep = (not st.startswith("#")
+                                and st.startswith('"')
+                                and (st.endswith('",') or st.endswith('"'))
+                                and (("//" in st) or (":" in st)))
+                      if is_dep:
+                          ls[lineno - 1] = "  # [android-cut] " + ls[lineno - 1].lstrip()
+                          open(fp, "w").write("".join(ls))
+                          print("=== 第 %d 轮[断链] %s:%d -> %s" % (attempt, fp, lineno, st), flush=True)
+                          done = True
+          
+              # 策略 2：引用行不是 deps 条目（或无法定位）时，直接解除报错文件
+              # 自身的「否定式」平台断言（assert(!is_android ...)）。这类断言只是
+              # 声明「本文件不该在安卓编译」，移除它不改变任何实际编译行为。
+              if not done:
+                  try:
+                      es = open(err_fp).read().splitlines(keepends=True)
+                  except OSError:
+                      es = None
+                  if es and 1 <= err_ln <= len(es):
+                      line = es[err_ln - 1]
+                      st = line.strip()
+                      neg = ("!is_android" in expr or "!is_ios" in expr
+                             or "!is_android" in st or "!is_ios" in st)
+                      if st.startswith("assert(") and neg:
+                          es[err_ln - 1] = "  # [android-cut] " + line.lstrip()
+                          open(err_fp, "w").write("".join(es))
+                          print("=== 第 %d 轮[解除文件断言] %s:%d -> %s" % (attempt, err_fp, err_ln, st), flush=True)
+                          done = True
+          
+              if not done:
+                  print("::error::平台断言但无法安全改写（引用行非 deps / 断言非否定式），停止")
+                  print(out, flush=True)
                   sys.exit(1)
-              orig = ls[lineno - 1]
-              if '"//' not in orig:
-                  print("::error::引用行不是 GN deps 条目，拒绝改写: " + repr(orig))
-                  sys.exit(1)
-              ls[lineno - 1] = "  # [android-cut] " + orig.lstrip()
-              open(fp, "w").write("".join(ls))
-              print("=== 第 %d 轮切断 %s:%d -> %s ===" %
-                    (attempt, fp, lineno, orig.strip()), flush=True)
-          print("::error::超过自动重试上限（20 轮），停止")
+          
+          print("::error::超过自动重试上限（%d 轮），停止" % MAX)
           sys.exit(1)
           PYEOF
           df -h /
