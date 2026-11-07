@@ -50,6 +50,20 @@ enable_extensions = true
 enable_pdf = false
 enable_plugins = false
 
+# 关闭家长控制（Supervised Users / Family Link）。
+# 根因：chrome/common/features.gni 里
+#   enable_supervised_users = is_chromeos || is_android
+# 即安卓默认为 true；而 chrome/browser/ui/BUILD.gn:1889 有一段
+# ChromeOS 专用家长许可对话框代码：
+#   if (enable_supervised_users && enable_extensions) {
+#     assert(is_chromeos)
+#     sources += [ views/supervised_user/... ]
+#   }
+# Kiwi 必须开 enable_extensions，两者叠加会在安卓 gn gen 直接断言失败。
+# 该功能对浏览器核心与扩展无关，用 GN declare_args 原生开关关闭即可，
+# 配套的 ENABLE_SUPERVISED_USERS buildflag 会让 C++ 侧自动屏蔽相关代码。
+enable_supervised_users = false
+
 disable_android_lint = true
 treat_warnings_as_errors = false
 
