@@ -195,9 +195,26 @@ jobs:
             echo "::warning::runhooks 返回非 0，仅当编译必需组件齐全时放行"
           fi
           echo "=== 校验编译必需组件（缺任一个即失败）==="
-          test -f src/third_party/llvm-build/Release+Asserts/bin/clang && echo "OK clang" || { echo "::error::clang 缺失"; exit 1; }
-          test -d src/build/linux/debian_bullseye_amd64-sysroot && echo "OK sysroot" || { echo "::error::sysroot 缺失"; exit 1; }
-          test -f src/third_party/node/linux/node-linux-x64/bin/node && echo "OK node" || { echo "::error::node 缺失"; exit 1; }
+          # 用标准 if 而非 "A && B || C"：后者会触发 shellcheck SC2015
+          # （"A && B || C is not if-then-else"），导致 Lint workflow 报红。
+          if [ -f src/third_party/llvm-build/Release+Asserts/bin/clang ]; then
+            echo "OK clang"
+          else
+            echo "::error::clang 缺失"
+            exit 1
+          fi
+          if [ -d src/build/linux/debian_bullseye_amd64-sysroot ]; then
+            echo "OK sysroot"
+          else
+            echo "::error::sysroot 缺失"
+            exit 1
+          fi
+          if [ -f src/third_party/node/linux/node-linux-x64/bin/node ]; then
+            echo "OK node"
+          else
+            echo "::error::node 缺失"
+            exit 1
+          fi
           echo "=== hooks 阶段完成 ==="
           df -h /
 
