@@ -415,17 +415,22 @@ jobs:
           import subprocess
           import sys
           
-          # 兜底：gn_all 已按平台短路，但根 BUILD.gn 里还有若干顶层
-          # builder/waterfall group（webui_closure_compile、chromium_builder_perf、
-          # gn_visibility、rust_* 等），GN 会把它们当默认 root 一起展开，仍会
-          # 拉入带文件级平台断言的桌面组件。这里在同一轮 job 内自动收敛：
-          #   策略 1（优先）注释掉 GN 报告的引用点 deps 条目，断开加载链；
-          #   策略 2        引用行不是 deps 时，解除报错文件自身的否定式平台断言。
-          # 每一步都打印到日志可审计；非平台断言、语法错误等一律原样失败。
-          MAX = 60
+          # 兜底：Kiwi overlay 用 "|| true" / "if (true)" 强行把桌面 WebUI 资源
+          # 引入安卓构建，但 overlay 不含配套 BUILD.gn（HTTP 404 已核实），
+          # rsync 后这些文件仍是 105 上游版本，顶层平台断言必然触发。
+          # 逐行注释 deps 是打地鼠：同一文件被多处引用，run42367227588
+          # 跑满 42 轮仍在同一批文件间循环。正确做法是直接解除报错文件自身的
+          # 平台断言 —— 该文件被 overlay 明确要求参与构建，断言只是「本不该在
+          # 安卓编译」的声明，移除后一轮即可彻底解决一个文件的全部引用点。
+          #   策略 1（优先）注释报错文件自身的平台断言（肯定式/否定式均可）；
+          #   策略 2        断言行无法安全改写时，再断开 GN 报告的 deps 引用点。
+          # 已处理位置会记录，同一位置重复报错立即停止，避免死循环。
+          # 非平台断言、语法错误等一律原样失败并打印完整输出。
+          MAX = 80
           PLATFORM_KW = ("is_android", "is_chromeos", "is_chromeos_ash", "is_win",
                          "is_mac", "is_linux", "is_ios", "is_fuchsia", "is_castos",
                          "toolkit_views", "use_aura", "is_desktop_android")
+          handled = set()
           
           
           def brief(out):
@@ -463,50 +468,58 @@ jobs:
                   sys.exit(1)
               err_fp, err_ln = em.group(1).lstrip("/"), int(em.group(2))
           
-              # 策略 1：引用点是 deps 列表项（相对 label 或 // 绝对 label 均可），
-              # 注释掉它即可让 GN 不再加载那个桌面 BUILD.gn 文件。
-              done = False
-              if sm:
-                  fp, lineno = sm.group(1).lstrip("/"), int(sm.group(2))
-                  try:
-                      ls = open(fp).read().splitlines(keepends=True)
-                  except OSError:
-                      ls = None
-                  if ls and 1 <= lineno <= len(ls):
-                      st = ls[lineno - 1].strip()
-                      is_dep = (not st.startswith("#")
-                                and st.startswith('"')
-                                and (st.endswith('",') or st.endswith('"'))
-                                and (("//" in st) or (":" in st)))
-                      if is_dep:
-                          ls[lineno - 1] = "  # [android-cut] " + ls[lineno - 1].lstrip()
-                          open(fp, "w").write("".join(ls))
-                          print("=== 第 %d 轮[断链] %s:%d -> %s" % (attempt, fp, lineno, st), flush=True)
-                          done = True
+          # 策略 1（优先）：直接解除报错文件自身的平台断言。断言只是声明
+          # 「本文件不该在安卓编译」，而 overlay 明确要求它参与构建，移除后
+          # 一个文件的所有引用点一次性全部通过，不再打地鼠。
+          done = False
+          key = (err_fp, err_ln)
+          try:
+              es = open(err_fp).read().splitlines(keepends=True)
+          except OSError:
+              es = None
+          if es and 1 <= err_ln <= len(es):
+              line = es[err_ln - 1]
+              st = line.strip()
+              if st.startswith("assert(") and any(k in expr for k in PLATFORM_KW):
+                  if key in handled:
+                      print("::error::同一断言重复报错，改写未生效，停止")
+                      print(out, flush=True)
+                      sys.exit(1)
+                  es[err_ln - 1] = "  # [android-cut] " + line.lstrip()
+                  open(err_fp, "w").write("".join(es))
+                  handled.add(key)
+                  print("=== 第 %d 轮[解除文件断言] %s:%d -> %s" % (attempt, err_fp, err_ln, st), flush=True)
+                  done = True
           
-              # 策略 2：引用行不是 deps 条目（或无法定位）时，直接解除报错文件
-              # 自身的「否定式」平台断言（assert(!is_android ...)）。这类断言只是
-              # 声明「本文件不该在安卓编译」，移除它不改变任何实际编译行为。
-              if not done:
-                  try:
-                      es = open(err_fp).read().splitlines(keepends=True)
-                  except OSError:
-                      es = None
-                  if es and 1 <= err_ln <= len(es):
-                      line = es[err_ln - 1]
-                      st = line.strip()
-                      neg = ("!is_android" in expr or "!is_ios" in expr
-                             or "!is_android" in st or "!is_ios" in st)
-                      if st.startswith("assert(") and neg:
-                          es[err_ln - 1] = "  # [android-cut] " + line.lstrip()
-                          open(err_fp, "w").write("".join(es))
-                          print("=== 第 %d 轮[解除文件断言] %s:%d -> %s" % (attempt, err_fp, err_ln, st), flush=True)
-                          done = True
+          # 策略 2：断言行不是 assert(...)（如跨行断言）时，退回注释 deps 引用点。
+          if not done and sm:
+              fp, lineno = sm.group(1).lstrip("/"), int(sm.group(2))
+              try:
+                  ls = open(fp).read().splitlines(keepends=True)
+              except OSError:
+                  ls = None
+              if ls and 1 <= lineno <= len(ls):
+                  st = ls[lineno - 1].strip()
+                  is_dep = (not st.startswith("#")
+                            and st.startswith('"')
+                            and (st.endswith('",') or st.endswith('"'))
+                            and (("//" in st) or (":" in st)))
+                  if is_dep:
+                      k2 = (fp, lineno)
+                      if k2 in handled:
+                          print("::error::同一 deps 重复报错，断链未生效，停止")
+                          print(out, flush=True)
+                          sys.exit(1)
+                      ls[lineno - 1] = "  # [android-cut] " + ls[lineno - 1].lstrip()
+                      open(fp, "w").write("".join(ls))
+                      handled.add(k2)
+                      print("=== 第 %d 轮[断链] %s:%d -> %s" % (attempt, fp, lineno, st), flush=True)
+                      done = True
           
-              if not done:
-                  print("::error::平台断言但无法安全改写（引用行非 deps / 断言非否定式），停止")
-                  print(out, flush=True)
-                  sys.exit(1)
+          if not done:
+              print("::error::平台断言但无法安全改写（断言行非 assert / 引用行非 deps），停止")
+              print(out, flush=True)
+              sys.exit(1)
           
           print("::error::超过自动重试上限（%d 轮），停止" % MAX)
           sys.exit(1)
