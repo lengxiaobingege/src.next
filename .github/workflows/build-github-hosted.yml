@@ -288,6 +288,80 @@ jobs:
           echo "===== args.gn ====="
           cat out/android_arm64/args.gn
 
+      # ============ 6.5 裁剪 gn_all 桌面测试目标（安卓）============
+      # 105 上游 gn_all 在 enable_extensions=true 时会拉入 extensions/shell
+      # 系列桌面测试目标，触发 keep_alive_registry 的 assert(!is_android)。
+      # 安卓官方构建默认 enable_extensions=false，本就不进入这些块，
+      # 所以在安卓下显式排除等价于官方配置。chrome_public_apk 由同文件的
+      # traffic_annotation_auditor_dependencies(is_android) 独立可达，不受影响。
+      - name: 裁剪 gn_all 桌面测试目标（安卓）
+        run: |
+          cd "$WORKSPACE/src"
+          python3 - <<'PYEOF'
+          import os
+          import sys
+
+          p = "BUILD.gn"
+          s = open(p).read()
+          patches = [
+            (
+              "  if (enable_extensions) {\n"
+              "    deps += [\n"
+              "      \"//extensions:extensions_browsertests\",\n"
+              "      \"//extensions:extensions_unittests\",\n"
+              "      \"//extensions/browser/api/declarative_net_request/filter_list_converter\",\n"
+              "      \"//extensions/shell:app_shell_unittests\",\n"
+              "    ]\n"
+              "  }",
+              "  if (enable_extensions && !is_android) {\n"
+              "    deps += [\n"
+              "      \"//extensions:extensions_browsertests\",\n"
+              "      \"//extensions:extensions_unittests\",\n"
+              "      \"//extensions/browser/api/declarative_net_request/filter_list_converter\",\n"
+              "      \"//extensions/shell:app_shell_unittests\",\n"
+              "    ]\n"
+              "  }",
+            ),
+            (
+              "    if (enable_extensions) {\n"
+              "      deps += [ \"//extensions/shell:app_shell\" ]\n"
+              "    }",
+              "    if (enable_extensions && !is_android) {\n"
+              "      deps += [ \"//extensions/shell:app_shell\" ]\n"
+              "    }",
+            ),
+          ]
+          for old, new in patches:
+              n = s.count(old)
+              if n != 1:
+                  print("::error::锚点匹配 %d 次（应为 1），拒绝静默放行" % n)
+                  print("片段: " + repr(old[:100]))
+                  sys.exit(1)
+              s = s.replace(old, new, 1)
+              print("OK 裁剪: " + new.splitlines()[0].strip())
+          open(p, "w").write(s)
+          print("=== 根 BUILD.gn 两处入口已切断 ===")
+
+          # 诊断：全树扫描并把仍引用 extensions/shell 的 BUILD.gn 写进日志，
+          # 若 GN 后续还报桌面链，可据此一次看清剩余入口。
+          hits = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d != ".git"]
+              for f in files:
+                  if f != "BUILD.gn":
+                      continue
+                  fp = os.path.join(root, f)
+                  try:
+                      t = open(fp, errors="ignore").read()
+                  except OSError:
+                      continue
+                  if '"//extensions/shell' in t:
+                      hits.append(fp)
+          print("=== 仍引用 //extensions/shell 的 BUILD.gn 共 %d 个 ===" % len(hits))
+          for x in hits[:30]:
+              print("   ", x)
+          PYEOF
+
       - name: gn gen
         run: |
           export PATH="$HOME/depot_tools:$PATH"
@@ -310,7 +384,7 @@ jobs:
 
       # ================= 8. 产物 =================
       - name: 收集 APK
-        if: always()
+        if: success()
         run: |
           cd "$WORKSPACE/src" 2>/dev/null || exit 0
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
@@ -318,7 +392,7 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
 
       - name: 上传 APK
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: kiwi-arm64-apk
