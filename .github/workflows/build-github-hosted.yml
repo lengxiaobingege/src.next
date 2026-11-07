@@ -1,14 +1,37 @@
-# 在 GitHub 官方 runner 上构建 Kiwi (arm64) — v3 修复磁盘问题
 # =============================================================================
-# v2 失败原因（已从 Actions 诊断信息确诊）：
-#   System.IO.IOException: No space left on device
-#   根因：切换 tag 后执行了第二次全量 gclient sync，
-#         新旧依赖叠加 + .git 对象膨胀，撑爆 145GB 磁盘
-# 修正：
-#   1. .gclient 的 URL 直接带版本号，只 sync 一次
-#   2. 移除"切换版本后再次 sync"步骤
-#   3. 最大化磁盘清理 + 全程监控 df
-#   4. 用 --prune 移除无用依赖
+# KiwiX 构建 v9 —— 修正基线：Chromium 105.0.5195.24 + Kiwi overlay
+# =============================================================================
+# 【v1~v8 全部失败的根本原因，已从仓库结构确诊】
+#
+#   之前的流程：
+#     gclient sync 拉 upstream 132.0.6834.83
+#     → rsync 仓库 `chromium` 分支到源码树（声称是「Kiwi 已 rebase 的增量」）
+#     → 结果：`chromium` 分支其实是 kiwibrowser/src.next 的【纯上游镜像】，
+#       每次 commit 都是 "[Chromium] Update version X to Y"，不含任何 Kiwi 代码。
+#       证据：chrome/browser/extensions/BUILD.gn 与官方 132 字节级一致（63603B），
+#             chrome/android/java/.../browser/ 下 66 个条目无一个 extensions 目录。
+#     → 等于「纯 upstream 132 + enable_extensions=true」，这是官方从未验证的组合，
+#       于是逐层撞 assert，v1~v8 修了 8 处仍在第 9 处失败
+#       （chrome/browser/search/background，桌面 views 组件）。
+#
+#   正确事实：
+#     kiwi 分支（默认分支）才是 Kiwi 的【补丁 overlay】，根目录只有
+#       base/ chrome/ components/ content/ extensions/ net/ remoting/
+#       services/ third_party/ toolbox/ ui/
+#     11 个目录 = 只含被改过的文件。
+#     其 CHROMIUM_VERSION = 105.0.5195.24，KIWI_VERSION = 105.0.5195.33
+#     —— 即 Kiwi Browser 停更时的真实基线是 105，不是 132。
+#     官方 .build/production_build_reference/args.gn 同样是
+#       enable_extensions = true + target_os = android，可正常出包。
+#     官方 `chrome/browser/extensions/BUILD.gn`（overlay 版）1441 行，
+#       已剔除 search/background、views/toolbar、views/side_panel、themes
+#       等全部桌面依赖 —— 这才是它能编译的原因。
+#
+#   v9 因此：
+#     1. 基线改回 105.0.5195.24
+#     2. rsync 来源改为 `kiwi` 分支（真补丁）
+#     3. 删除 v1~v8 的 8 处 assert 修补（105 不需要，强行套用会 exit 1）
+#     4. args 对齐官方 production_build_reference
 # =============================================================================
 
 name: 'Kiwi: GitHub-hosted Build arm64'
@@ -25,9 +48,9 @@ on:
         required: true
         default: 'KiwiX'
       chromiumTag:
-        description: 'Chromium tag（必须与 chromium 分支 rebase 的版本一致：132.0.6834.83）'
+        description: 'Chromium tag（必须与 kiwi overlay 的 CHROMIUM_VERSION 一致）'
         required: true
-        default: '132.0.6834.83'
+        default: '105.0.5195.24'
 
 jobs:
   build:
@@ -35,17 +58,15 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      # ================= 1. 极限腾空间 =================
+      # ================= 1. 腾空间 =================
       - name: 极限清理磁盘
         run: |
           echo "=== 清理前 ==="
           df -h /
 
-          # 关闭 swap
           sudo swapoff -a || true
           sudo rm -f /swapfile /mnt/swapfile || true
 
-          # 删除巨型预装无用软件
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /opt/ghc || true
@@ -56,11 +77,9 @@ jobs:
           sudo rm -rf /usr/local/lib/node_modules || true
           sudo rm -rf /opt/hostedtoolcache || true
 
-          # 清理包缓存
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/* || true
           sudo rm -rf /var/cache/apt/archives/* || true
-          sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /opt/hostedtoolcache/CodeQL || true
           sudo rm -rf /imagegeneration || true
           sudo rm -rf /usr/lib/jvm/*/jmods || true
@@ -89,11 +108,14 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt-get update -qq
+          # Chromium 105 时代的工具链要求：JDK 11/17 均可，py3 必须有
           sudo apt-get install -y -qq \
             python3 python3-pip python3-venv \
             openjdk-17-jdk-headless \
-            ccache ninja-build pkg-config file
+            ccache ninja-build pkg-config file \
+            libnss3-dev libgconf-2-4 libpci3 || true
           java -version 2>&1 | head -2
+          python3 --version
           ccache --max-size=2G
           echo "CCACHE_DIR=${HOME}/.ccache" >> "${GITHUB_ENV}"
 
@@ -104,8 +126,8 @@ jobs:
             "$HOME/depot_tools"
           echo "${HOME}/depot_tools" >> "${GITHUB_PATH}"
 
-      # ================= 3. 单次 gclient sync =================
-      - name: 配置 .gclient（版本直接写入 URL，避免二次 sync）
+      # ================= 3. 单次 gclient sync（锁定 105） =================
+      - name: 配置 .gclient（版本直接写入 URL，只 sync 一次）
         run: |
           WS="${RUNNER_WORKSPACE}/chromium"
           mkdir -p "$WS"
@@ -114,7 +136,6 @@ jobs:
 
           TAG="${{ github.event.inputs.chromiumTag }}"
 
-          # 关键：@TAG 直接锁定版本，一次到位
           cat > .gclient <<EOF
           solutions = [
             {
@@ -137,18 +158,16 @@ jobs:
           cd "$WORKSPACE"
           echo "开始: $(date)"
           df -h /
-          # --shallow: 只拉所需深度
-          # --no-history: 不要完整历史
           gclient sync --nohooks --no-history --shallow -j 8
           echo "结束: $(date)"
           echo "=== 磁盘 ==="
           df -h /
           echo "=== 源码体积 ==="
           du -sh src 2>/dev/null || true
-          echo "=== 验证版本 ==="
+          echo "=== 验证版本（必须看到 105.0.5195.24）==="
           cd src && git log -1 --oneline
 
-      - name: 运行 hooks（下载工具链）
+      - name: 运行 hooks（下载工具链 / Android SDK）
         run: |
           export PATH="$HOME/depot_tools:$PATH"
           cd "$WORKSPACE"
@@ -157,137 +176,53 @@ jobs:
           echo "=== hooks 完成 ==="
           df -h /
 
-      # ================= 4. Kiwi 补丁 =================
-      - name: 检出构建配置（kiwi 分支的 args-kiwi.gn）
+      # ================= 4. 应用 Kiwi overlay =================
+      - name: 检出 Kiwi overlay 与构建配置（kiwi 分支）
         uses: actions/checkout@v4
         with:
           ref: kiwi
           path: config
 
-      - name: 检出 Kiwi 改动（chromium 分支 = 已 rebase 到 132 的增量）
-        uses: actions/checkout@v4
-        with:
-          ref: chromium
-          path: kiwi-patch
-
-      - name: 应用 Kiwi 定制
+      - name: 校验 overlay 完整性
         run: |
-          cd "$GITHUB_WORKSPACE/kiwi-patch"
-          echo "=== 补丁文件数 ==="
-          find . -type f -not -path "./.git/*" -not -path "./.github/*" | wc -l
+          cd "$GITHUB_WORKSPACE/config"
+          echo "=== CHROMIUM_VERSION（应为 105.0.5195.24）==="
+          cat CHROMIUM_VERSION
+          echo "=== overlay 顶层目录 ==="
+          ls -1
+          # 硬性校验：若 overlay 目录缺失，说明检出错了分支，立即失败
+          for d in chrome extensions components; do
+            if [ ! -d "$d" ]; then
+              echo "::error::overlay 缺少目录 $d，分支检出不正确"
+              exit 1
+            fi
+          done
+          echo "=== 关键文件存在性 ==="
+          test -f chrome/browser/extensions/BUILD.gn && echo "OK chrome/browser/extensions/BUILD.gn"
+          test -f extensions/browser/BUILD.gn && echo "OK extensions/browser/BUILD.gn"
+
+      - name: 应用 Kiwi 定制（rsync overlay 到源码树）
+        run: |
+          cd "$GITHUB_WORKSPACE/config"
           rsync -a \
             --exclude='.git' --exclude='.github' --exclude='.build' \
             --exclude='CHROMIUM_VERSION' --exclude='KIWI_VERSION' --exclude='VERSION' \
             --exclude='README.md' --exclude='LICENSE' --exclude='*.svg' \
+            --exclude='args-kiwi.gn' --exclude='args-kiwi-105.gn' \
             ./ "$WORKSPACE/src/"
+
           cd "$WORKSPACE/src"
-          echo "=== 改动文件数 ==="
+          echo "=== 覆盖文件数（应数千量级；若为 0 说明 overlay 没生效）==="
           git status --short | wc -l
 
-          # ---------- 上游 bug 修正（不属于 Kiwi 补丁）----------
-          # 根因：官方 enable_extensions 的默认值是
-          #   enable_extensions = !is_android && !is_ios && !is_castos && !is_fuchsia
-          # 即官方从未在安卓上验证过 enable_extensions=true 这条路径。
-          # Kiwi 的扩展支持必须打开它，于是踩进多处在 if(enable_extensions)
-          # 里引用了 assert(!is_android) 目标的代码块。
-          # 修法统一：给这些仅含测试/桌面专用依赖的块补上 !is_android，
-          # 与 chrome/test/BUILD.gn 把 browser_tests 包在 if(!is_android) 内的做法一致。
-          # 只影响测试目标，不影响扩展功能本身。
-          #
-          # 已定位（按暴露顺序）：
-          #   1. extensions/BUILD.gn:332  test("extensions_browsertests")
-          #        → ui/web_dialogs:test_support（BUILD.gn:5 assert(!is_android)）
-          #   2. extensions/BUILD.gn:328  deps += //extensions/shell:unit_tests
-          #        → shell:app_shell_lib → //apps（apps/BUILD.gn:10 assert）
-          #   3. chrome/test/BUILD.gn:308  if (enable_extensions) 块内的
-          #        //chrome/browser/apps/app_service 与 //apps:test_support
-          echo "=== 修正上游 enable_extensions 块的 android 保护 ==="
-          python3 - <<'PY'
-          import sys
-
-          def apply(path, fixes, label):
-              s = open(path).read()
-              for i, (old, new) in enumerate(fixes, 1):
-                  if old not in s:
-                      print(f'ERROR: {path} 修补 {i} 未匹配到目标代码块，请人工确认')
-                      sys.exit(1)
-                  s = s.replace(old, new, 1)
-                  print(f'  {path} 修补 {i} 完成')
-              open(path, 'w').write(s)
-              print(f'{label} 完成')
-
-          # --- extensions/BUILD.gn: 两处 ---
-          apply('extensions/BUILD.gn', [
-            ('if (enable_extensions) {\n  # Browser tests are not currently supported in desktop-android builds.\n  test("extensions_browsertests") {',
-             'if (enable_extensions && !is_android) {\n  # Browser tests are not currently supported in desktop-android builds.\n  test("extensions_browsertests") {'),
-            ('if (enable_extensions) {\n    deps += [ "//extensions/shell:unit_tests" ]\n  }',
-             'if (enable_extensions && !is_android) {\n    deps += [ "//extensions/shell:unit_tests" ]\n  }'),
-          ], 'extensions/BUILD.gn')
-
-          # --- chrome/test/BUILD.gn: 两处 ---
-          # 修补 3: 第 308 行 test_support 内的 enable_extensions 块
-          #   （引用 //chrome/browser/apps/app_service 与 //apps:test_support）
-          # 修补 6: 第 8511 行 unit_tests 内的 enable_extensions 块
-          #   （引用 //chrome/browser/ui/global_error、//ui/web_dialogs、//apps/ui/views）
-          # 其余 if(enable_extensions)（1404/3916/10259/10377/10729/11927）
-          # 均在 if(!is_android) 或 if(is_chromeos_ash) 的 target 内，安卓下不会展开，无需处理。
-          apply('chrome/test/BUILD.gn', [
-            ('  if (enable_extensions) {\n    sources += [\n      "../browser/apps/platform_apps/app_browsertest_util.cc",',
-             '  if (enable_extensions && !is_android) {\n    sources += [\n      "../browser/apps/platform_apps/app_browsertest_util.cc",'),
-            ('  # TODO(crbug.com/1229899): Clean up and move this to a separate target.\n  if (enable_extensions) {\n    sources += [\n      "../../apps/saved_files_service_unittest.cc",',
-             '  # TODO(crbug.com/1229899): Clean up and move this to a separate target.\n  if (enable_extensions && !is_android) {\n    sources += [\n      "../../apps/saved_files_service_unittest.cc",'),
-          ], 'chrome/test/BUILD.gn')
-
-          # --- 根 BUILD.gn: 一处（gn_all 里的 enable_extensions 块）---
-          # 这是整条桌面测试依赖链的源头：
-          # gn gen 默认解析全图（含 gn_all），该块无条件把
-          #   //extensions:extensions_browsertests
-          #   //extensions:extensions_unittests
-          #   //extensions/shell:app_shell_unittests
-          # 拉进依赖树；而 extensions/shell 子系统通篇没有 is_android 判断，
-          # 其 app_shell_lib 依赖 40+ 个 assert(!is_android) 的桌面组件。
-          # gn_all 只是「全部目标清单」，不影响 chrome_public_apk 的编译内容，
-          # 在安卓下跳过其中桌面专用测试目标即可。
-          apply('BUILD.gn', [
-            ('    if (enable_extensions) {\n      deps += [\n        "//extensions:extensions_browsertests",',
-             '    if (enable_extensions && !is_android) {\n      deps += [\n        "//extensions:extensions_browsertests",'),
-            # 修补 5: gn_all 的 is_android 分支里还有一处（第 579 行）：
-            #   if (is_android) { ... if (enable_extensions) { deps += //extensions/shell:app_shell } }
-            #   → app_shell → app_shell_lib → //apps → assert(!is_android)
-            ('      if (enable_extensions) {\n        deps += [ "//extensions/shell:app_shell" ]\n      }',
-             '      if (enable_extensions && !is_android) {\n        deps += [ "//extensions/shell:app_shell" ]\n      }'),
-          ], 'BUILD.gn (gn_all)')
-
-          # --- apps/BUILD.gn: 放宽 assert（修补 7）---
-          # 根因：chrome/browser:browser 的 enable_extensions 块无条件依赖 //apps
-          #   （第 7747 行），而 browser 是 chrome_public_apk 的必经依赖，
-          #   这条 //apps 引用无法绕开（Kiwi 扩展功能需要它所在的块）。
-          # //apps 实际是「Chrome Apps 平台应用」基础设施库，源码 include
-          #   全部为跨平台模块（apps/ extensions/ content/ base/），
-          #   deps 也全部跨平台（base/content/extensions/components）。
-          # 官方的 assert(!is_android && !is_ios) 只是"安卓没有 Chrome Apps"的
-          #   产品性限制，并非技术上不可编译。放宽为仅排除 iOS。
-          apply('apps/BUILD.gn', [
-            ('assert(!is_android && !is_ios)',
-             'assert(!is_ios)'),
-          ], 'apps/BUILD.gn')
-
-          # --- chrome/browser/ui/apps/BUILD.gn: 放宽 assert（修补 8）---
-          # chrome/browser/extensions 的 extensions target 顶层无条件依赖
-          #   //chrome/browser/ui/apps（第 755 行），无法绕开。
-          # 该 target 的 sources 全是 .h 头文件（不参与编译），public_deps
-          #   （base/extensions/ui base/gfx）均为安卓支持的跨平台模块。
-          # 实际的 .cc 实现（views 对话框）在另一个 :impl target 里，安卓不引用。
-          # 放宽 assert：把「桌面平台白名单」改为「仅排除 iOS」。
-          apply('chrome/browser/ui/apps/BUILD.gn', [
-            ('assert(is_win || is_mac || is_linux || is_chromeos)',
-             'assert(!is_ios)'),
-          ], 'chrome/browser/ui/apps/BUILD.gn')
-          PY
-          echo "=== 校验 ==="
-          grep -c 'enable_extensions && !is_android' extensions/BUILD.gn chrome/test/BUILD.gn BUILD.gn
-          grep -n 'assert(!is_ios)' apps/BUILD.gn chrome/browser/ui/apps/BUILD.gn
-          df -h /
+          # 关键断言：overlay 必须真的改到了扩展层
+          echo "=== 校验：Kiwi 的 extensions BUILD.gn 已生效（应无 views/side_panel）==="
+          if grep -q 'ui/views/side_panel' chrome/browser/extensions/BUILD.gn; then
+            echo "::error::chrome/browser/extensions/BUILD.gn 仍是桌面版，overlay 未生效"
+            exit 1
+          fi
+          echo "OK: 已替换为 Kiwi 裁剪版"
+          grep -c 'enable_extensions' chrome/browser/extensions/BUILD.gn || true
 
       # ================= 5. 签名 =================
       - name: 生成 keystore
@@ -307,8 +242,8 @@ jobs:
           mkdir -p out/android_arm64
           cp "$GITHUB_WORKSPACE/config/args-kiwi.gn" out/android_arm64/args.gn
           sed -i "s|__PKG__|${{ github.event.inputs.packageName }}|" out/android_arm64/args.gn
+          sed -i "s|__LABEL__|${{ github.event.inputs.appLabel }}|" out/android_arm64/args.gn
           echo "===== args.gn ====="
-          cat out/android_arm64/args.gn
           cat out/android_arm64/args.gn
 
       - name: gn gen
@@ -347,4 +282,3 @@ jobs:
           name: kiwi-arm64-apk
           path: ${{ github.workspace }}/artifacts/*.apk
           retention-days: 30
-          if-no-files-found: warn
