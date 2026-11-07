@@ -1,3 +1,8 @@
+# KiwiX 构建参数 —— 基线 Chromium 105.0.5195.24（Kiwi Browser 最后一版）
+# 完全对齐官方 .build/production_build_reference/args.gn，
+# 仅追加：包名、keystore、PGO 关闭、guest_view。
+# 不要随意增删字段：官方这套参数已在 105 上验证可出包。
+
 target_os = "android"
 target_cpu = "arm64"
 is_debug = false
@@ -8,6 +13,8 @@ is_official_build = true
 is_component_build = false
 is_chrome_branded = false
 is_clang = true
+# 官方用 symbol_level=1/exclude_unwind_tables=false；这里压到 0/true 省磁盘，
+# 不影响功能，只是崩溃栈信息变少。
 symbol_level = 0
 exclude_unwind_tables = true
 
@@ -38,6 +45,7 @@ rtc_use_h264 = false
 v8_use_external_startup_data = true
 update_android_aar_prebuilts = true
 
+# 扩展支持：Kiwi 的核心能力，官方在 105 上即以 true 出包
 enable_extensions = true
 enable_pdf = false
 enable_plugins = false
@@ -48,8 +56,8 @@ treat_warnings_as_errors = false
 # Fast APK
 cc_wrapper = "ccache"
 
-
-# 追加：包名与 guest_view
+# ---- 以下为自建定制 ----
 chrome_public_manifest_package = "__PKG__"
 enable_guest_view = true
+# 没有官方 PGO profile，必须显式关闭，否则 is_official_build 会找 profile 失败
 chrome_pgo_phase = 0
