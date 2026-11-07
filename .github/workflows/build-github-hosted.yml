@@ -367,6 +367,25 @@ jobs:
           open(p, "w").write(s)
           print("=== 根 BUILD.gn 裁剪完成 ===")
 
+          # 家长控制的 ChromeOS 专用块：args 里虽已设
+          # enable_supervised_users=false，但 GN 加载整个 BUILD.gn 时
+          # 仍会执行文件内的 assert(is_chromeos)（run24 暴露）。
+          # 注释 deps 引用挡不住文件级断言，故在源码层直接给这些块
+          # 加 !is_android 保护，覆盖 chrome/browser 与 ui 两处同款块。
+          old_su = "if (enable_supervised_users && enable_extensions) {"
+          new_su = "if (enable_supervised_users && enable_extensions && !is_android) {"
+          for fp in ["chrome/browser/BUILD.gn", "chrome/browser/ui/BUILD.gn"]:
+              if not os.path.isfile(fp):
+                  print("::warning::%s 不存在，跳过" % fp)
+                  continue
+              t = open(fp).read()
+              n = t.count(old_su)
+              if n == 0:
+                  print("::warning::%s 未找到该块（overlay 可能已裁剪）" % fp)
+                  continue
+              open(fp, "w").write(t.replace(old_su, new_su))
+              print("=== %s: %d 处家长控制块加 !is_android 保护 ===" % (fp, n))
+
           # 诊断：全树扫描并把仍引用 extensions/shell 的 BUILD.gn 写进日志，
           # 若 GN 后续还报桌面链，可据此一次看清剩余入口。
           hits = []
@@ -400,16 +419,37 @@ jobs:
           # 组件。只对「桌面组件被拉进安卓」这一类断言做精确切断：
           # 依据 GN 日志里的 See //X/BUILD.gn:N，注释掉那一条 deps 引用，
           # 然后重试。所有改动都写入日志可审计；非此类错误一律原样失败。
-          for attempt in range(1, 9):
+          # 诊断：打印 GN 实际解析到的关键变量值，便于核对 args 是否生效
+          probe = subprocess.run(
+              ["gn", "args", "out/android_arm64",
+               "--list=enable_supervised_users", "--short"],
+              capture_output=True, text=True)
+          print("=== GN 变量诊断 ===")
+          print((probe.stdout + probe.stderr).strip())
+
+          for attempt in range(1, 21):
               r = subprocess.run(["gn", "gen", "out/android_arm64"],
                                  capture_output=True, text=True)
               out = r.stdout + r.stderr
-              print(out, flush=True)
+              # 只回显诊断相关行，避免 20 轮把日志刷满
+              keys = ("ERROR at", "Assertion failed", "assert(", "See //",
+                      "which caused", "Undefined", "I/O error")
+              brief = [l for l in out.splitlines() if any(k in l for k in keys)]
+              print("\n".join(brief), flush=True)
               if r.returncode == 0:
                   print("=== gn gen 成功（第 %d 轮）===" % attempt)
                   sys.exit(0)
-              if "Assertion failed" not in out or "assert(!is_android" not in out:
-                  print("::error::非平台断言类错误，不自动改写，停止")
+              if "Assertion failed" not in out:
+                  print("::error::非断言类错误，不自动改写，停止")
+                  sys.exit(1)
+              # 覆盖所有「平台不匹配」类断言：assert(is_chromeos)、
+              # assert(!is_android && !is_ios)、assert(is_win || ...) 等
+              am = re.search(r"\bassert\(([^)]*)\)", out)
+              platform_kw = ("is_android", "is_chromeos", "is_win", "is_mac",
+                             "is_linux", "is_ios", "is_fuchsia", "is_castos",
+                             "toolkit_views", "use_aura", "is_chromeos_ash")
+              if not am or not any(k in am.group(1) for k in platform_kw):
+                  print("::error::断言非平台类，不自动改写，停止")
                   sys.exit(1)
               m = re.search(r"See (//[^:]+/BUILD\.gn):(\d+):(\d+): which caused", out)
               if not m:
@@ -428,7 +468,7 @@ jobs:
               open(fp, "w").write("".join(ls))
               print("=== 第 %d 轮切断 %s:%d -> %s ===" %
                     (attempt, fp, lineno, orig.strip()), flush=True)
-          print("::error::超过自动重试上限（8 轮），停止")
+          print("::error::超过自动重试上限（20 轮），停止")
           sys.exit(1)
           PYEOF
           df -h /
